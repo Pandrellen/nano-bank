@@ -186,6 +186,16 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
          DROP CONSTRAINT IF EXISTS interac_recipients_customer_id_email_key",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_interac_recipients_active \
          ON interac_recipients(customer_id, email) WHERE status = 'active'",
+        // Notification-outbox drainer bookkeeping. Additive self-heal for DBs
+        // predating the flush-notifications consumer: a retry counter (its budget
+        // caps a permanently-failing send — a dead-letter, not an infinite loop),
+        // the last error for observability, and a delivery timestamp.
+        "ALTER TABLE interac_notifications \
+         ADD COLUMN IF NOT EXISTS delivery_attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE interac_notifications \
+         ADD COLUMN IF NOT EXISTS last_delivery_error TEXT",
+        "ALTER TABLE interac_notifications \
+         ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP WITH TIME ZONE",
     ] {
         sqlx::query(ddl).execute(pool).await?;
     }

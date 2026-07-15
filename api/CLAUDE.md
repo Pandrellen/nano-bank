@@ -83,7 +83,12 @@ synthetic customer `interac@nano.bank` owns `INTERAC_CLEARING` (chequing) and
 `INTERAC_SETTLEMENT` (savings), $1T overdraft, bootstrapped at startup like the
 card rails' system accounts. Three auth planes: customer (`/etransfers`,
 `/autodeposit`), service-token network (`/network/*`), service-token admin
-(`/admin/sweep-expired`). Security answers are argon2-hashed (`utils/password`),
+(`/admin/sweep-expired`, `/admin/flush-notifications`). The notification outbox
+has a **drainer** on the admin plane (`flush_notifications`): it claims
+undelivered rows with `FOR UPDATE SKIP LOCKED` (the claim is an atomic
+`delivery_attempts += 1`, so there's no in-flight state to strand on a crash),
+delivers each via a stubbed seam, and dead-letters a row past `MAX_DELIVERY_ATTEMPTS`;
+a k8s CronJob triggers it. Security answers are argon2-hashed (`utils/password`),
 3-strike lock on claim. `available_balance` is hand-recomputed on **customer**
 accounts around rail posts (the balance trigger only maintains `balance`); the
 system clearing/settlement accounts keep it at 0. Full detail in the repo-root
