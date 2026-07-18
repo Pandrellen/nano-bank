@@ -12,8 +12,8 @@ pub mod finance;
 pub mod health;
 pub mod interac;
 pub mod interac_payees;
-pub mod lynx;
 pub mod ledger;
+pub mod lynx;
 pub mod mandates;
 pub mod security;
 pub mod transactions;
@@ -21,6 +21,7 @@ pub mod transactions;
 use std::sync::Arc;
 
 use crate::config::{database::DatabasePool, Settings};
+use crate::fraud::FraudCheck;
 use crate::ledger::Ledger;
 
 // Shared application state
@@ -30,4 +31,6 @@ pub struct AppState {
     pub settings: Settings,
     /// The accounting core (modern or legacy) behind the swappable Ledger port.
     pub ledger: Arc<dyn Ledger>,
+    /// The fraud screening backend (engine or no-op) behind the FraudCheck port.
+    pub fraud: Arc<dyn FraudCheck>,
 }
