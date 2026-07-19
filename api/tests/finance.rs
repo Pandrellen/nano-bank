@@ -135,6 +135,19 @@ async fn balances(c: &reqwest::Client) -> Value {
         .unwrap()
 }
 
+async fn account_balance(c: &reqwest::Client, token: &str, account_id: Uuid) -> f64 {
+    let v: Value = c
+        .get(format!("{}/api/v1/accounts/{}/balance", base_url(), account_id))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    as_num(&v["balance"])
+}
+
 /// A $10,000 deposit at 3% accrues $0.82 for one day; the run is idempotent and
 /// the GL shows the accrued-interest-payable side.
 #[tokio::test]
@@ -199,4 +212,71 @@ async fn daily_accrual_posts_and_is_idempotent() {
         }),
         "balances should list the accrued-interest-payable account after accrual"
     );
+}
+
+/// A $1,000 deposit (below the maintenance waiver) accrues $0.08 for a day, then
+/// capitalisation credits the interest and charges the $4 maintenance fee, and is
+/// idempotent per period. A unique far-future period keeps the run isolated across
+/// re-runs of the suite (the batch is idempotent per period).
+#[tokio::test]
+async fn capitalisation_credits_interest_and_charges_maintenance() {
+    let c = client();
+    require_stack!(&c);
+
+    let email = create_customer(&c).await;
+    let token = login(&c, &email).await;
+    let acct = create_account(&c, &token, "chequing").await; // auto 3%
+    if !deposit(&c, &token, acct, 1_000.0).await {
+        eprintln!("SKIP: GL core unavailable (deposit 503)");
+        return;
+    }
+
+    let svc = service_token(&c).await;
+    // Unique period/date per run so period-level idempotency doesn't collide.
+    let n = Uuid::new_v4().as_u128();
+    let year = 2200 + (n % 400) as i64;
+    let period = format!("{year}-06");
+    let as_of = format!("{year}-06-15");
+
+    // Accrue one day: 1000 * 0.03 / 365 = 0.08.
+    let ar = c
+        .post(format!("{}/api/v1/finance/accrue", base_url()))
+        .bearer_auth(&svc)
+        .json(&json!({ "as_of": as_of }))
+        .send()
+        .await
+        .unwrap();
+    if ar.status().as_u16() == 503 {
+        eprintln!("SKIP: GL core unavailable (accrue 503)");
+        return;
+    }
+    assert!(ar.status().is_success(), "accrue: {}", ar.status());
+
+    let before = account_balance(&c, &token, acct).await;
+    assert!((before - 1000.0).abs() < 1e-6, "pre-capitalisation balance should be 1000, got {before}");
+
+    let post_cap = || async {
+        c.post(format!("{}/api/v1/finance/capitalise", base_url()))
+            .bearer_auth(&svc)
+            .json(&json!({ "period": period }))
+            .send()
+            .await
+            .unwrap()
+    };
+
+    let r1 = post_cap().await;
+    assert!(r1.status().is_success(), "capitalise: {}", r1.status());
+    let v1: Value = r1.json().await.unwrap();
+
+    // 1000 + 0.08 interest - 4.00 maintenance = 996.08.
+    let after = account_balance(&c, &token, acct).await;
+    assert!((after - 996.08).abs() < 1e-6, "post-capitalisation balance should be 996.08, got {after}");
+
+    // Idempotent: re-running the period moves nothing and returns the same totals.
+    let r2 = post_cap().await;
+    assert!(r2.status().is_success(), "re-capitalise: {}", r2.status());
+    let v2: Value = r2.json().await.unwrap();
+    assert_eq!(v2["economic_event_id"], v1["economic_event_id"], "same event id on re-run");
+    let after2 = account_balance(&c, &token, acct).await;
+    assert!((after2 - 996.08).abs() < 1e-6, "re-run must not move the balance, got {after2}");
 }
