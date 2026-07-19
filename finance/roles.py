@@ -27,6 +27,10 @@ _ROLE_CODES: dict[str, tuple[str, str]] = {
     "OperatingExpense": ("OPEX", "0000400200"),
     "AccruedInterestReceivable": ("ACCR_INT_RECV", "0000141900"),
     "AccruedInterestPayable": ("ACCR_INT_PAY", "0000220000"),
+    # Core-native tax accounts (not Ledger-port roles, but present in the trial
+    # balance and needed for a complete/balanced Balance Sheet).
+    "InputTax": ("INPUT_TAX", "0000175000"),
+    "OutputTax": ("OUTPUT_TAX", "0000175100"),
 }
 
 _CODE_TO_ROLE: dict[str, str] = {}
@@ -45,8 +49,9 @@ STATEMENT_LINE: dict[str, str] = {
     "CardReceivable": "asset", "OverdraftReceivable": "asset",
     "LoansReceivable": "asset", "TreasuryPlacement": "asset",
     "AccruedInterestReceivable": "asset",
+    "InputTax": "asset",
     "Payable": "liability", "CustomerDeposits": "liability",
-    "AccruedInterestPayable": "liability",
+    "AccruedInterestPayable": "liability", "OutputTax": "liability",
     "Capital": "equity", "RetainedEarnings": "equity",
     "Revenue": "income", "InterestIncome": "income",
     "InterchangeIncome": "income", "FeeIncome": "income",

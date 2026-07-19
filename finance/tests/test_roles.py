@@ -17,6 +17,17 @@ def test_statement_classification():
     assert roles.STATEMENT_LINE["InterestExpense"] == "expense"
 
 
+def test_tax_accounts_classified():
+    # Both cores seed input/output tax; they must classify so the trial balance
+    # (and the Balance Sheet) is complete.
+    assert roles.role_for_code("INPUT_TAX") == "InputTax"
+    assert roles.role_for_code("0000175000") == "InputTax"
+    assert roles.role_for_code("OUTPUT_TAX") == "OutputTax"
+    assert roles.role_for_code("0000175100") == "OutputTax"
+    assert roles.STATEMENT_LINE["InputTax"] == "asset"
+    assert roles.STATEMENT_LINE["OutputTax"] == "liability"
+
+
 def test_earning_assets_exclude_cash_reserves():
     assert "CashReserves" not in roles.EARNING_ASSET_ROLES
     assert roles.EARNING_ASSET_ROLES == {

@@ -19,6 +19,24 @@ def test_balance_sheet_balances():
     assert bs["balanced"] is True
 
 
+def test_balance_sheet_folds_unclosed_earnings_into_equity():
+    # Income/expense are not closed to retained earnings in this GL, so the sheet
+    # only balances when current earnings (income - expense) count as equity.
+    # Trial balance (debit-credit): assets 1500 + expense 40 = deposits 1400
+    # + capital 100 + income 40.
+    snap = _snapshot(
+        CashReserves="1500",           # asset 1500
+        OperatingExpense="40",         # expense 40 (debit +)
+        CustomerDeposits="-1400",      # liability 1400
+        Capital="-100",                # equity 100
+        FeeIncome="-40",               # income 40 (credit -)
+    )
+    bs = reports.balance_sheet(snap)
+    assert bs["total_assets"] == D("1500")
+    assert bs["equity"]["CurrentEarnings"] == D("0")   # income 40 - expense 40
+    assert bs["balanced"] is True
+
+
 def test_income_statement_period_flow():
     opening = _snapshot(InterestIncome="-100", InterestExpense="20", FeeIncome="-5")
     closing = _snapshot(InterestIncome="-130", InterestExpense="26", FeeIncome="-8")

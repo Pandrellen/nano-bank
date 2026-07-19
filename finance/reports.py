@@ -20,6 +20,14 @@ def balance_sheet(snapshot: dict) -> dict:
     assets = _line_total(snapshot, "asset", credit_normal=False)
     liabilities = _line_total(snapshot, "liability", credit_normal=True)
     equity = _line_total(snapshot, "equity", credit_normal=True)
+    # Income/expense are not closed to retained earnings in this GL; fold current
+    # earnings (income - expense to date) into equity so the sheet balances
+    # (A = L + E + net income — the trial-balance identity).
+    income = _line_total(snapshot, "income", credit_normal=True)
+    expense = _line_total(snapshot, "expense", credit_normal=False)
+    equity = dict(equity)
+    equity["CurrentEarnings"] = (
+        sum(income.values(), Decimal(0)) - sum(expense.values(), Decimal(0)))
     ta = sum(assets.values(), Decimal(0))
     tle = sum(liabilities.values(), Decimal(0)) + sum(equity.values(), Decimal(0))
     return {
