@@ -142,6 +142,11 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
         "ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'revoke_mandate'",
         // Additive: DBs whose mandates table predates the Phase-2 payee allowlist.
         "ALTER TABLE mandates ADD COLUMN IF NOT EXISTS allowed_payees UUID[]",
+        // Economics tag columns (interest / NIM engine, spec #2). Additive; existing rows stay NULL.
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product TEXT",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS cost_centre TEXT",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS economic_event_id UUID",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_event ON transactions(economic_event_id)",
         // Phase 3: step-up pending approvals.
         r#"
         CREATE TABLE IF NOT EXISTS pending_approvals (

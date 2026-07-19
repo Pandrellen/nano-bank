@@ -13,6 +13,9 @@ CREATE TABLE transactions (
     initiated_by UUID REFERENCES customers(customer_id),
     external_reference VARCHAR(100), -- For external system references
     metadata JSONB, -- Flexible field for additional transaction data
+    product TEXT,             -- economics tag: deposit|card|overdraft|loan|treasury|payment
+    cost_centre TEXT,         -- economics tag: lending|deposits|payments|treasury
+    economic_event_id UUID,   -- stable id shared by all postings of one economic event
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     processed_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
