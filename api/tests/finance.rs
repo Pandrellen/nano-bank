@@ -178,7 +178,12 @@ async fn daily_accrual_posts_and_is_idempotent() {
     }
 
     let svc = service_token(&c).await;
-    let date = "2026-07-19";
+    // Unique far-future date per run: accrual_runs (and thus GL posting) is keyed
+    // by date in nano-bank's shared DB, so a fixed date consumed by an earlier run
+    // (e.g. against the other core) would return cached totals and skip the post.
+    let n = Uuid::new_v4().as_u128();
+    let year = 2400 + (n % 300) as i64;
+    let date = format!("{year}-03-10");
 
     let post_accrue = || async {
         c.post(format!("{}/api/v1/finance/accrue", base_url()))
