@@ -80,6 +80,62 @@ async fn external_cash_id(state: &AppState) -> Result<Uuid, AppError> {
     .ok_or_else(|| AppError::ServiceUnavailable("external cash account not initialised".to_string()))
 }
 
+/// Charge the flat outgoing e-transfer fee to the sender's deposit account and
+/// recognize it as fee income (tagged `product=payment`, `cost_centre=payments`).
+/// Returns the fee charged (zero if configured off or deferred by the overdraft
+/// floor). Call inside the sender's transaction, before it commits.
+pub(crate) async fn charge_etransfer_fee(
+    state: &AppState,
+    tx: &mut Tx<'_>,
+    sender_account_id: Uuid,
+    sender_customer_id: Uuid,
+) -> Result<Decimal, AppError> {
+    let fee = state.settings.finance_config().etransfer_fee;
+    if fee <= Decimal::ZERO {
+        return Ok(Decimal::ZERO);
+    }
+    // Fee floor: never force the sender past its overdraft limit.
+    let (balance, overdraft_limit) = sqlx::query_as::<_, (Decimal, Decimal)>(
+        "SELECT balance, overdraft_limit FROM accounts WHERE account_id = $1",
+    )
+    .bind(sender_account_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if balance - fee < -overdraft_limit {
+        tracing::warn!(%sender_account_id, "e-transfer fee deferred: would breach overdraft limit");
+        return Ok(Decimal::ZERO);
+    }
+    let cash_id = external_cash_id(state).await?;
+    let reference = reference_number("FEE");
+    let txn_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO transactions \
+           (reference_number, transaction_type, amount, description, status, initiated_by, \
+            completed_at, product, cost_centre, economic_event_id) \
+         VALUES ($1,'fee',$2,'Interac e-Transfer fee','completed',$3, \
+                 CURRENT_TIMESTAMP,'payment','payments',$4) RETURNING transaction_id",
+    )
+    .bind(&reference)
+    .bind(fee)
+    .bind(sender_customer_id)
+    .bind(Uuid::new_v4())
+    .fetch_one(&mut **tx)
+    .await?;
+    // Customer debit (balance down); EXTERNAL_CASH credit.
+    post_two_legged(tx, txn_id, sender_account_id, "debit", cash_id, "credit", fee).await?;
+    recompute_available(tx, sender_account_id).await?;
+    post_balanced(
+        state,
+        &reference,
+        "Interac e-Transfer fee",
+        vec![
+            line(Gl::CustomerDeposits, Direction::Debit, fee),
+            line(Gl::FeeIncome, Direction::Credit, fee),
+        ],
+    )
+    .await?;
+    Ok(fee)
+}
+
 // ---------------------------------------------------------------------------
 // accrue (daily)
 // ---------------------------------------------------------------------------

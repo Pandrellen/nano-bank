@@ -341,3 +341,53 @@ async fn card_capture_recognizes_interchange() {
         "interchange income should rise by 1.50, before={before} after={after}"
     );
 }
+
+/// Sending an outgoing e-transfer charges the $1.50 fee: the sender is debited
+/// the amount plus the fee, and fee income moves in the GL.
+#[tokio::test]
+async fn etransfer_charges_fee_income() {
+    let c = client();
+    require_stack!(&c);
+
+    let email = create_customer(&c).await;
+    let token = login(&c, &email).await;
+    let acct = create_account(&c, &token, "chequing").await;
+    if !deposit(&c, &token, acct, 1_000.0).await {
+        eprintln!("SKIP: GL core unavailable (deposit 503)");
+        return;
+    }
+
+    let fee_before = gl_balance_abs(&c, &["FEE_INCOME", "0000800300"]).await;
+
+    // Send $50 to an external handle (security Q&A path; funds are held).
+    let handle = format!("ext_{}@example.com", Uuid::new_v4().as_u128() % 1_000_000);
+    let resp = c
+        .post(format!("{}/api/v1/interac/etransfers", base_url()))
+        .bearer_auth(&token)
+        .json(&json!({
+            "from_account_id": acct,
+            "amount": 50.0,
+            "recipient_handle_type": "email",
+            "recipient_handle_value": handle,
+            "security_question": "pet?",
+            "security_answer": "rex"
+        }))
+        .send()
+        .await
+        .unwrap();
+    if resp.status().as_u16() == 503 {
+        eprintln!("SKIP: GL core unavailable (e-transfer 503)");
+        return;
+    }
+    assert!(resp.status().is_success(), "send e-transfer: {}", resp.status());
+
+    // 1000 - 50 held - 1.50 fee = 948.50.
+    let bal = account_balance(&c, &token, acct).await;
+    assert!((bal - 948.50).abs() < 1e-6, "balance should be 948.50 after send+fee, got {bal}");
+
+    let fee_after = gl_balance_abs(&c, &["FEE_INCOME", "0000800300"]).await;
+    assert!(
+        (fee_after - fee_before - 1.50).abs() < 1e-6,
+        "fee income should rise by 1.50, before={fee_before} after={fee_after}"
+    );
+}
