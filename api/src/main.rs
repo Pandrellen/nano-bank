@@ -1,6 +1,7 @@
 mod aft;
 mod config;
 mod errors;
+mod finance;
 mod handlers;
 mod ledger;
 mod lynx;

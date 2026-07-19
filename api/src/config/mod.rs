@@ -18,6 +18,62 @@ pub struct Settings {
     pub lynx: LynxSettings,
     #[serde(default)]
     pub agent: AgentSettings,
+    #[serde(default)]
+    pub finance: FinanceSettings,
+}
+
+/// Interest / NIM engine tunables (spec #2). Overridable via `config/*.toml` or
+/// layered env vars (e.g. `NANO_BANK__FINANCE__ETRANSFER_FEE`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct FinanceSettings {
+    /// Interchange income rate on card purchases, in basis points. Default 150.
+    #[serde(with = "rust_decimal::serde::str", default = "default_interchange_bps")]
+    pub interchange_bps: Decimal,
+    /// Flat fee charged per outgoing e-transfer. Default $1.50.
+    #[serde(with = "rust_decimal::serde::str", default = "default_etransfer_fee")]
+    pub etransfer_fee: Decimal,
+    /// Monthly account-maintenance fee. Default $4.00.
+    #[serde(with = "rust_decimal::serde::str", default = "default_maintenance_fee")]
+    pub maintenance_fee: Decimal,
+    /// Maintenance fee is waived at/above this balance. Default $3000.
+    #[serde(with = "rust_decimal::serde::str", default = "default_maintenance_waiver")]
+    pub maintenance_waiver: Decimal,
+}
+
+fn default_interchange_bps() -> Decimal {
+    Decimal::new(150, 0)
+}
+fn default_etransfer_fee() -> Decimal {
+    Decimal::new(150, 2)
+}
+fn default_maintenance_fee() -> Decimal {
+    Decimal::new(400, 2)
+}
+fn default_maintenance_waiver() -> Decimal {
+    Decimal::new(3000, 0)
+}
+
+impl Default for FinanceSettings {
+    fn default() -> Self {
+        Self {
+            interchange_bps: default_interchange_bps(),
+            etransfer_fee: default_etransfer_fee(),
+            maintenance_fee: default_maintenance_fee(),
+            maintenance_waiver: default_maintenance_waiver(),
+        }
+    }
+}
+
+impl Settings {
+    /// Resolve the finance tunables into the engine's `FinanceConfig`.
+    pub fn finance_config(&self) -> crate::finance::FinanceConfig {
+        crate::finance::FinanceConfig {
+            interchange_bps: self.finance.interchange_bps,
+            etransfer_fee: self.finance.etransfer_fee,
+            maintenance_fee: self.finance.maintenance_fee,
+            maintenance_waiver: self.finance.maintenance_waiver,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -231,6 +287,7 @@ impl Default for Settings {
             interac: InteracSettings::default(),
             lynx: LynxSettings::default(),
             agent: AgentSettings::default(),
+            finance: FinanceSettings::default(),
         }
     }
 }
