@@ -52,11 +52,27 @@ fn line(account: Gl, direction: Direction, amount: Decimal) -> EntryLine {
     EntryLine { account, direction, amount }
 }
 
+/// Drop a customer account's `available_balance` to 0 before posting a leg that
+/// lowers `balance`, so `chk_available_balance_logical` (available <= balance +
+/// overdraft) can't trip mid-statement. Recompute the true value afterwards.
+/// Same guard the rails use around their posts.
+async fn zero_available(tx: &mut Tx<'_>, account_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE accounts SET available_balance = 0 WHERE account_id = $1")
+        .bind(account_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Refresh a customer account's available balance (the balance trigger maintains
-/// only `balance`). Mirrors `transactions::recompute_available`.
+/// only `balance`). Deposit accounts: balance + overdraft − holds; a credit card:
+/// limit − balance − holds (available credit shrinks as the owed balance grows).
 async fn recompute_available(tx: &mut Tx<'_>, account_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE accounts SET available_balance = balance + overdraft_limit \
+        "UPDATE accounts SET available_balance = CASE \
+             WHEN account_type = 'credit_card' \
+               THEN overdraft_limit - balance \
+               ELSE balance + overdraft_limit END \
            - COALESCE((SELECT sum(amount) FROM account_holds \
                        WHERE account_id = $1 AND released_at IS NULL), 0), \
            updated_at = CURRENT_TIMESTAMP \
@@ -121,6 +137,7 @@ pub(crate) async fn charge_etransfer_fee(
     .fetch_one(&mut **tx)
     .await?;
     // Customer debit (balance down); EXTERNAL_CASH credit.
+    zero_available(tx, sender_account_id).await?;
     post_two_legged(tx, txn_id, sender_account_id, "debit", cash_id, "credit", fee).await?;
     recompute_available(tx, sender_account_id).await?;
     post_balanced(
@@ -352,6 +369,7 @@ async fn capitalise(
         .bind(&reference).bind(amount).bind(customer_id).bind(event_id)
         .fetch_one(&mut *tx).await?;
         // Customer credit (balance up); EXTERNAL_CASH debit.
+        zero_available(&mut tx, *account_id).await?;
         post_two_legged(&mut tx, txn_id, cash_id, "debit", *account_id, "credit", *amount).await?;
         recompute_available(&mut tx, *account_id).await?;
         deposit_total += *amount;
@@ -382,6 +400,7 @@ async fn capitalise(
         .bind(&reference).bind(amount).bind(customer_id).bind(event_id)
         .fetch_one(&mut *tx).await?;
         // Card credit (owed up); EXTERNAL_CASH debit.
+        zero_available(&mut tx, *account_id).await?;
         post_two_legged(&mut tx, txn_id, cash_id, "debit", *account_id, "credit", *amount).await?;
         recompute_available(&mut tx, *account_id).await?;
         asset_total += *amount;
@@ -427,6 +446,7 @@ async fn capitalise(
         .bind(&reference).bind(fee).bind(customer_id).bind(event_id)
         .fetch_one(&mut *tx).await?;
         // Customer debit (balance down); EXTERNAL_CASH credit.
+        zero_available(&mut tx, *account_id).await?;
         post_two_legged(&mut tx, txn_id, *account_id, "debit", cash_id, "credit", fee).await?;
         recompute_available(&mut tx, *account_id).await?;
         maintenance_total += fee;
