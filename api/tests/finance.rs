@@ -135,6 +135,20 @@ async fn balances(c: &reqwest::Client) -> Value {
         .unwrap()
 }
 
+/// Sum the GL balance of the account(s) named by any of `names` (accepts the
+/// modern code or the legacy saknr), as an absolute magnitude (sign-agnostic).
+async fn gl_balance_abs(c: &reqwest::Client, names: &[&str]) -> f64 {
+    let bal = balances(c).await;
+    bal.as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|a| names.contains(&a["account"].as_str().unwrap_or("")))
+                .map(|a| as_num(&a["balance"]).abs())
+                .sum()
+        })
+        .unwrap_or(0.0)
+}
+
 async fn account_balance(c: &reqwest::Client, token: &str, account_id: Uuid) -> f64 {
     let v: Value = c
         .get(format!("{}/api/v1/accounts/{}/balance", base_url(), account_id))
@@ -279,4 +293,51 @@ async fn capitalisation_credits_interest_and_charges_maintenance() {
     assert_eq!(v2["economic_event_id"], v1["economic_event_id"], "same event id on re-run");
     let after2 = account_balance(&c, &token, acct).await;
     assert!((after2 - 996.08).abs() < 1e-6, "re-run must not move the balance, got {after2}");
+}
+
+/// A $100 card capture recognizes $1.50 interchange income (150 bps) in the GL.
+#[tokio::test]
+async fn card_capture_recognizes_interchange() {
+    let c = client();
+    require_stack!(&c);
+
+    let email = create_customer(&c).await;
+    let token = login(&c, &email).await;
+    let card = create_account(&c, &token, "credit_card").await; // active, $5000 limit
+    let svc = service_token(&c).await;
+
+    let before = gl_balance_abs(&c, &["INTERCHANGE", "0000800200"]).await;
+
+    // Authorize $100.
+    let auth = c
+        .post(format!("{}/api/v1/cards/authorize", base_url()))
+        .bearer_auth(&svc)
+        .json(&json!({ "account_id": card, "amount": 100.00, "merchant": "Test Merchant" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(auth.status().is_success(), "authorize: {}", auth.status());
+    let av: Value = auth.json().await.unwrap();
+    assert_eq!(av["status"], "approved", "authorize should approve");
+    let auth_id = av["auth_id"].as_str().expect("auth_id").to_string();
+
+    // Capture it (posts the purchase GL + interchange).
+    let cap = c
+        .post(format!("{}/api/v1/cards/capture", base_url()))
+        .bearer_auth(&svc)
+        .json(&json!({ "auth_id": auth_id }))
+        .send()
+        .await
+        .unwrap();
+    if cap.status().as_u16() == 503 {
+        eprintln!("SKIP: GL core unavailable (capture 503)");
+        return;
+    }
+    assert!(cap.status().is_success(), "capture: {}", cap.status());
+
+    let after = gl_balance_abs(&c, &["INTERCHANGE", "0000800200"]).await;
+    assert!(
+        (after - before - 1.50).abs() < 1e-6,
+        "interchange income should rise by 1.50, before={before} after={after}"
+    );
 }

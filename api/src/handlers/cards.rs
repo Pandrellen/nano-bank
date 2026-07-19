@@ -402,6 +402,33 @@ async fn capture(
     .execute(&mut *tx)
     .await?;
 
+    // Recognize interchange income (issuer earns a bps cut on the purchase) and
+    // tag the purchase with its economics keys. Interchange is bank-vs-network, so
+    // it has no customer-account leg — a GL-only post, before commit like the
+    // purchase GL above.
+    let cfg = state.settings.finance_config();
+    let interchange = crate::finance::interchange_amount(amount, cfg.interchange_bps);
+    if interchange > Decimal::ZERO {
+        post_gl_entry(
+            &state,
+            &reference,
+            "Card interchange income",
+            GlAccount::CashReserves,
+            GlAccount::InterchangeIncome,
+            interchange,
+        )
+        .await?;
+    }
+    let event_id = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE transactions SET product = 'card', cost_centre = 'payments', \
+         economic_event_id = $2 WHERE transaction_id = $1",
+    )
+    .bind(txn_id)
+    .bind(event_id)
+    .execute(&mut *tx)
+    .await?;
+
     tx.commit().await?;
 
     tracing::info!(
