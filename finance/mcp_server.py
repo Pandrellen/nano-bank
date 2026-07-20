@@ -5,9 +5,9 @@ from decimal import Decimal
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from .config import Settings
+from .config import Settings, RiskConfig
 from .db import FinanceDB
-from . import ledger_client, snapshots, reports
+from . import ledger_client, snapshots, reports, metrics
 
 
 @dataclass
@@ -89,6 +89,31 @@ def build_mcp(deps: Deps) -> FastMCP:
         interchange = inc["income"].get("InterchangeIncome", Decimal(0))
         return _stringify(reports.segment_pnl(
             deps.db.accruals(start, end), deps.db.fees(start, end), interchange))
+
+    @mcp.tool()
+    def raroc(period: str) -> dict:
+        """Risk-adjusted return on capital (Basel-lite) for a period."""
+        _, _, prior, days = _month_range(period)
+        return _stringify(metrics.raroc(
+            deps.db.read_snapshot(period), deps.db.read_snapshot(prior),
+            days, RiskConfig.from_env()))
+
+    @mcp.tool()
+    def key_ratios(period: str) -> dict:
+        """Key CFO ratios (ROA/ROE/efficiency/LDR/leverage/CoF/yield) for a period."""
+        _, _, prior, days = _month_range(period)
+        return _stringify(metrics.key_ratios(
+            deps.db.read_snapshot(period), deps.db.read_snapshot(prior),
+            days, RiskConfig.from_env()))
+
+    @mcp.tool()
+    def financial_health(period: str) -> dict:
+        """Full financial-health bundle: balance sheet, income statement, NIM,
+        key ratios and RAROC for a period."""
+        _, _, prior, days = _month_range(period)
+        return _stringify(metrics.financial_health(
+            deps.db.read_snapshot(period), deps.db.read_snapshot(prior),
+            days, RiskConfig.from_env()))
 
     return mcp
 

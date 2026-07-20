@@ -90,3 +90,14 @@ def key_ratios(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dic
         "yield_on_earning_assets": _safe_div(ann(ii),
                                              nim_out["avg_earning_assets"]),
     }
+
+
+def financial_health(closing: dict, opening: dict, days: int,
+                     risk: RiskConfig) -> dict:
+    return {
+        "balance_sheet": reports.balance_sheet(closing),
+        "income_statement": reports.income_statement(closing, opening),
+        "nim": reports.nim(closing, opening, days),
+        "key_ratios": key_ratios(closing, opening, days, risk),
+        "raroc": raroc(closing, opening, days, risk),
+    }

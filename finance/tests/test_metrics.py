@@ -93,3 +93,13 @@ def test_key_ratios_guard_zero_denominators():
     r = metrics.key_ratios({}, {}, days=30, risk=RC)
     assert r["roa"] is None
     assert r["loan_to_deposit"] is None
+
+
+def test_financial_health_bundle_keys():
+    closing = {"CashReserves": D("100"), "Capital": D("-100"),
+               "InterestIncome": D("-10")}
+    opening = {"InterestIncome": D("0")}
+    fh = metrics.financial_health(closing, opening, days=30, risk=RC)
+    assert set(fh) == {"balance_sheet", "income_statement", "nim",
+                       "key_ratios", "raroc"}
+    assert fh["raroc"]["net_income"] == D("10")
