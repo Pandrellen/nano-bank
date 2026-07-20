@@ -48,3 +48,45 @@ def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
         "rwa": ec["rwa"],
         "raroc": _safe_div(rar, ec["economic_capital"]),
     }
+
+
+def key_ratios(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
+    bs = reports.balance_sheet(closing)
+    inc = reports.income_statement(closing, opening)
+    nim_out = reports.nim(closing, opening, days)
+    ec = economic_capital(closing, risk)
+
+    def ann(x: Decimal) -> Decimal:
+        return x * Decimal(365) / Decimal(days)
+
+    ni_ann = ann(inc["net_income"])
+
+    ii = inc["income"].get("InterestIncome", Decimal(0))
+    ie = inc["expense"].get("InterestExpense", Decimal(0))
+    fee = inc["income"].get("FeeIncome", Decimal(0))
+    interchange = inc["income"].get("InterchangeIncome", Decimal(0))
+    opex = inc["expense"].get("OperatingExpense", Decimal(0))
+    total_revenue = (ii - ie) + fee + interchange
+
+    total_assets = bs["total_assets"]
+    total_equity = sum(bs["equity"].values(), Decimal(0))
+    capital_base = sum((v for k, v in bs["equity"].items()
+                        if k != "CurrentEarnings"), Decimal(0))
+    loans = sum((closing.get(r, Decimal(0)) for r in
+                 ("CardReceivable", "OverdraftReceivable", "LoansReceivable")),
+                Decimal(0))
+    deposits_close = -closing.get("CustomerDeposits", Decimal(0))
+    deposits_open = -opening.get("CustomerDeposits", Decimal(0))
+    avg_deposits = (deposits_open + deposits_close) / Decimal(2)
+
+    return {
+        "roa": _safe_div(ni_ann, total_assets),
+        "roe": _safe_div(ni_ann, capital_base),
+        "efficiency_ratio": _safe_div(opex, total_revenue),
+        "loan_to_deposit": _safe_div(loans, deposits_close),
+        "leverage_ratio": _safe_div(total_equity, total_assets),
+        "rwa_capital_ratio": _safe_div(total_equity, ec["total_rwa"]),
+        "cost_of_funds": _safe_div(ann(ie), avg_deposits),
+        "yield_on_earning_assets": _safe_div(ann(ii),
+                                             nim_out["avg_earning_assets"]),
+    }
