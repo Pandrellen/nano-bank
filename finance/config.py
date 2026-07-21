@@ -7,11 +7,16 @@ from typing import Mapping, Optional
 
 _DEFAULT_WEIGHTS = {
     "CashReserves": Decimal("0"),
+    "Bank": Decimal("0.20"),            # interbank / central-bank claim
     "TreasuryPlacement": Decimal("0.20"),
     "CardReceivable": Decimal("0.75"),
     "OverdraftReceivable": Decimal("1.00"),
     "LoansReceivable": Decimal("1.00"),
 }
+# Any asset role without an explicit weight is risk-weighted at this rate.
+# It must never be 0: an unmapped asset silently treated as risk-free collapses
+# RWA, and with it economic capital, which makes RAROC explode.
+_DEFAULT_ASSET_WEIGHT = Decimal("1.00")
 _DEFAULT_LOSS = {
     "CardReceivable": Decimal("0.03"),
     "OverdraftReceivable": Decimal("0.02"),
@@ -25,6 +30,7 @@ class RiskConfig:
     risk_weights: dict
     loss_rates: dict
     target_ratio: Decimal
+    default_asset_weight: Decimal = _DEFAULT_ASSET_WEIGHT
 
     @classmethod
     def default(cls) -> "RiskConfig":
@@ -44,7 +50,10 @@ class RiskConfig:
             if (v := e.get(f"RISK_LOSS_{role}")) is not None:
                 loss[role] = Decimal(v)
         ratio = Decimal(e.get("RISK_TARGET_RATIO", "0.10"))
-        return cls(risk_weights=weights, loss_rates=loss, target_ratio=ratio)
+        default_w = Decimal(e.get("RISK_DEFAULT_ASSET_WEIGHT",
+                                  str(_DEFAULT_ASSET_WEIGHT)))
+        return cls(risk_weights=weights, loss_rates=loss, target_ratio=ratio,
+                   default_asset_weight=default_w)
 
 
 @dataclass

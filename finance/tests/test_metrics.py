@@ -103,3 +103,30 @@ def test_financial_health_bundle_keys():
     assert set(fh) == {"balance_sheet", "income_statement", "nim",
                        "key_ratios", "raroc"}
     assert fh["raroc"]["net_income"] == D("10")
+
+
+def test_every_asset_role_carries_a_risk_weight():
+    """Assets outside the configured weights must NOT be treated as risk-free."""
+    snap = {"Bank": D("1000000"), "Receivable": D("2000"),
+            "CashReserves": D("500"), "CustomerDeposits": D("-900000")}
+    ec = metrics.economic_capital(snap, RC)
+    # Bank is an interbank claim (20%); generic Receivable falls back to 100%;
+    # cash reserves stay 0%; the deposit liability is not an asset at all.
+    assert ec["rwa"]["Bank"] == D("200000.00")
+    assert ec["rwa"]["Receivable"] == D("2000.00")
+    assert ec["rwa"]["CashReserves"] == D("0.00")
+    assert "CustomerDeposits" not in ec["rwa"]
+    assert ec["total_rwa"] == D("202000.00")
+
+
+def test_default_asset_weight_is_configurable():
+    rc = RiskConfig.from_env({"RISK_DEFAULT_ASSET_WEIGHT": "0.50"})
+    ec = metrics.economic_capital({"Receivable": D("1000")}, rc)
+    assert ec["rwa"]["Receivable"] == D("500.00")
+
+
+def test_raroc_declares_its_provisioning_basis():
+    """The books carry no loan-loss provision, so net income is pre-provision
+    and RAROC — not ROE — is where credit cost lands. Say so in the output."""
+    out = metrics.raroc({"LoansReceivable": D("1000")}, {}, days=30, risk=RC)
+    assert "pre-provision" in out["basis"]

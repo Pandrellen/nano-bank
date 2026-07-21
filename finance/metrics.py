@@ -5,7 +5,7 @@ replaces it behind the same signatures.
 """
 from __future__ import annotations
 from decimal import Decimal
-from . import reports
+from . import reports, roles
 from .config import RiskConfig
 
 
@@ -14,10 +14,18 @@ def _safe_div(n: Decimal, d: Decimal):
 
 
 def economic_capital(snapshot: dict, risk: RiskConfig) -> dict:
+    """Risk-weight EVERY asset on the balance sheet.
+
+    Assets are driven off the snapshot rather than off the weight table, so a
+    role nobody configured (say a new receivable) falls back to the default
+    weight instead of silently counting as risk-free.
+    """
     rwa: dict[str, Decimal] = {}
-    for role, weight in risk.risk_weights.items():
-        bal = snapshot.get(role, Decimal(0))
-        rwa[role] = (bal * weight).quantize(Decimal("0.01"))
+    for role in set(snapshot) | set(risk.risk_weights):
+        if roles.STATEMENT_LINE.get(role) != "asset":
+            continue
+        weight = risk.risk_weights.get(role, risk.default_asset_weight)
+        rwa[role] = (snapshot.get(role, Decimal(0)) * weight).quantize(Decimal("0.01"))
     total = sum(rwa.values(), Decimal(0))
     return {"rwa": rwa, "total_rwa": total,
             "economic_capital": (total * risk.target_ratio).quantize(Decimal("0.01"))}
@@ -47,6 +55,12 @@ def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
         "total_rwa": ec["total_rwa"],
         "rwa": ec["rwa"],
         "raroc": _safe_div(rar, ec["economic_capital"]),
+        # The GL has no loan-loss provision account, so credit cost is NOT in
+        # net income; it enters here as expected loss. Consumers (the CFO agent
+        # included) must not describe ROA/ROE as after-credit-loss measures.
+        "basis": ("net income is pre-provision — the ledger books no loan-loss "
+                  "provision, so expected credit loss is deducted here in RAROC "
+                  "and is NOT reflected in net income, ROA or ROE"),
     }
 
 
