@@ -1,4 +1,6 @@
 import Link from "next/link";
+import Header from "../components/Header";
+import Footer from "../components/Footer";
 
 export default function Home() {
   return (
@@ -13,23 +15,7 @@ export default function Home() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-nanobank-orange-deep/10 blur-[120px]"></div>
       </div>
 
-      {/* Header */}
-      <header className="relative z-10 w-full max-w-7xl mx-auto px-6 py-6 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-nanobank-blue-green to-nanobank-blue-sky flex items-center justify-center font-bold text-nanobank-blue-deep shadow-md">
-            N
-          </div>
-          <span className="text-xl font-bold tracking-tight bg-gradient-to-r from-white via-slate-100 to-nanobank-blue-sky bg-clip-text text-transparent">
-            Nano-Bank
-          </span>
-        </div>
-        <Link 
-          href="/auth/signin" 
-          className="text-sm font-medium text-nanobank-blue-sky hover:text-white transition-colors duration-200"
-        >
-          Sign In
-        </Link>
-      </header>
+      <Header />
 
       {/* Main Hero Section */}
       <main className="relative z-10 flex-1 flex items-center">
@@ -109,15 +95,13 @@ export default function Home() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-6 flex flex-col sm:flex-row items-center justify-between border-t border-white/5 gap-4">
-        <p className="text-xs text-slate-500">&copy; {new Date().getFullYear()} Nano-Bank. All rights reserved.</p>
-        <div className="flex gap-6 text-xs text-slate-500">
-          <a href="#" className="hover:text-slate-300 transition-colors">Privacy Policy</a>
-          <a href="#" className="hover:text-slate-300 transition-colors">Terms of Service</a>
-          <a href="#" className="hover:text-slate-300 transition-colors">Contact</a>
-        </div>
-      </footer>
+      <Footer
+        links={[
+          { label: "Privacy Policy", href: "#" },
+          { label: "Terms of Service", href: "#" },
+          { label: "Contact", href: "#" },
+        ]}
+      />
     </div>
   );
 }

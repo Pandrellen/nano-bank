@@ -19,7 +19,7 @@ export default function SigninForm() {
       const response = await signInAction(formData);
       if (response.success) {
         toast.success(response.message);
-        router.push("/");
+        router.push("/dashboard");
       } else {
         toast.error(response.message);
       }

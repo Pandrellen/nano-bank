@@ -1,5 +1,7 @@
 import Link from "next/link";
 import SigninForm from "./SigninForm";
+import Header from "../../../components/Header";
+import Footer from "../../../components/Footer";
 
 export default async function Page() {
   return (
@@ -14,17 +16,7 @@ export default async function Page() {
         <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-nanobank-orange-deep/10 blur-[120px]"></div>
       </div>
 
-      {/* Header */}
-      <header className="relative z-10 w-full max-w-7xl mx-auto px-6 py-6 flex items-center justify-between">
-        <Link href="/" className="flex items-center gap-2 group">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-nanobank-blue-green to-nanobank-blue-sky flex items-center justify-center font-bold text-nanobank-blue-deep shadow-md transform group-hover:scale-105 transition-transform">
-            N
-          </div>
-          <span className="text-xl font-bold tracking-tight bg-gradient-to-r from-white via-slate-100 to-nanobank-blue-sky bg-clip-text text-transparent">
-            Nano-Bank
-          </span>
-        </Link>
-      </header>
+      <Header />
 
       {/* Main Form Container */}
       <main className="relative z-10 flex-1 flex items-center justify-center px-6 py-12">
@@ -44,7 +36,7 @@ export default async function Page() {
 
           {/* Redirect link */}
           <div className="text-center mt-6 text-xs text-slate-400">
-            Don't have an account?{" "}
+            Don&apos;t have an account?{" "}
             <Link href="/auth/signup" className="text-nanobank-blue-sky font-semibold hover:underline">
               Sign up here
             </Link>
@@ -52,14 +44,7 @@ export default async function Page() {
         </div>
       </main>
 
-      {/* Footer */}
-      <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-6 flex flex-col sm:flex-row items-center justify-between border-t border-white/5 gap-4">
-        <p className="text-xs text-slate-500">&copy; {new Date().getFullYear()} Nano-Bank. All rights reserved.</p>
-        <div className="flex gap-6 text-xs text-slate-500">
-          <a href="#" className="hover:text-slate-300 transition-colors">Privacy Policy</a>
-          <a href="#" className="hover:text-slate-300 transition-colors">Terms of Service</a>
-        </div>
-      </footer>
+      <Footer />
     </div>
   );
 }

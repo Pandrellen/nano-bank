@@ -1,5 +1,10 @@
 "use server";
 
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
+
 export interface SignUpResult {
   success: boolean;
   message: string;
@@ -14,17 +19,6 @@ export async function signUpAction(formData: FormData): Promise<SignUpResult> {
   const sin = formData.get("sin");
   const password = formData.get("password");
 
-  console.log("Sign-up action triggered with fields:", {
-    email,
-    phoneNumber,
-    firstName,
-    lastName,
-    dateOfBirth,
-    sin,
-    password: password ? "[REDACTED]" : null,
-  });
-
-  // Placeholder logic: simulating successful creation or simple check
   if (!email || !password || !firstName || !lastName || !phoneNumber || !dateOfBirth || !sin) {
     return {
       success: false,
@@ -32,8 +26,38 @@ export async function signUpAction(formData: FormData): Promise<SignUpResult> {
     };
   }
 
-  // Simulate server validation delay
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/customers`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        email,
+        phone_number: phoneNumber,
+        first_name: firstName,
+        last_name: lastName,
+        date_of_birth: dateOfBirth,
+        sin: String(sin).replace(/\D/g, ""),
+        password,
+      }),
+      cache: "no-store",
+    });
+  } catch (error) {
+    console.error("Sign-up request failed:", error);
+    return {
+      success: false,
+      message: "Unable to reach the server. Please try again.",
+    };
+  }
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    return {
+      success: false,
+      message: data?.error?.message || "Unable to create account.",
+    };
+  }
 
   return {
     success: true,
@@ -50,11 +74,6 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
   const email = formData.get("email");
   const password = formData.get("password");
 
-  console.log("Sign-in action triggered with fields:", {
-    email,
-    password: password ? "[REDACTED]" : null,
-  });
-
   if (!email || !password) {
     return {
       success: false,
@@ -62,12 +81,72 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
     };
   }
 
-  // Simulate server sign-in validation delay
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/auth/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email, password }),
+      cache: "no-store",
+    });
+  } catch (error) {
+    console.error("Sign-in request failed:", error);
+    return {
+      success: false,
+      message: "Unable to reach the server. Please try again.",
+    };
+  }
 
-  // Placeholder logic: allowing any sign in for now
+  const data = await response.json();
+
+  if (!response.ok) {
+    return {
+      success: false,
+      message: data?.error?.message || "Invalid email or password.",
+    };
+  }
+
+  const { access_token, refresh_token, expires_in } = data;
+
+  const cookieStore = await cookies();
+  cookieStore.set("access_token", access_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: expires_in,
+  });
+  cookieStore.set("refresh_token", refresh_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+  });
+
   return {
     success: true,
     message: "Successfully signed in!",
   };
+}
+
+export async function logoutAction(): Promise<void> {
+  const cookieStore = await cookies();
+  const accessToken = cookieStore.get("access_token")?.value;
+
+  if (accessToken) {
+    try {
+      await fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+        cache: "no-store",
+      });
+    } catch (error) {
+      console.error("Logout request failed:", error);
+    }
+  }
+
+  cookieStore.delete("access_token");
+  cookieStore.delete("refresh_token");
+
+  redirect("/auth/signin");
 }
