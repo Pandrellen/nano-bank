@@ -2,6 +2,8 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import Header from "../../components/Header";
 import Footer from "../../components/Footer";
+import TokenCountdown from "../../components/TokenCountdown";
+import { decodeJwtExpiry } from "../../lib/jwt";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
 
@@ -36,6 +38,8 @@ export default async function Page() {
         redirect("/auth/signin");
     }
 
+    const tokenExpiry = decodeJwtExpiry(accessToken);
+
     return (
         <div className="relative min-h-screen flex flex-col justify-between bg-nanobank-blue-deep text-white overflow-hidden font-sans">
             {/* Background Gradient Orbs and Grid */}
@@ -58,6 +62,11 @@ export default async function Page() {
                             Welcome back, {profile.first_name}
                         </h1>
                         <p className="text-slate-400 text-sm mt-2">{profile.email}</p>
+                        {tokenExpiry !== null && (
+                            <p className="text-xs mt-2">
+                                <TokenCountdown expiresAt={tokenExpiry} />
+                            </p>
+                        )}
                     </div>
 
                     <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 p-8 text-center text-sm text-slate-400">
