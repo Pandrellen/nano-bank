@@ -5,10 +5,16 @@ the Agent CFO has a real balance sheet to talk about.
 
 ```bash
 bash cfo/demo/run-cfo-stack.sh     # start everything, prints the console URL
-bash cfo/demo/seed-demo-bank.sh    # generate the event stack + close the period
+bash cfo/demo/seed-demo-bank.sh    # reset the GL, generate the events, close the period
 # → chat at http://localhost:8506
 bash cfo/demo/run-cfo-stack.sh --stop
 ```
+
+`seed-demo-bank.sh` resets and repopulates the GL on every run (via
+`reset-gl.sh`) so the demo is reproducible — posting a second opening book on
+top of the first would double the balance sheet. Pass `--keep-gl` to skip it.
+The reset clears the **core's journal and `gl_snapshots` only**; nano-bank's own
+Postgres — customers, accounts, mandates, rail history — is untouched.
 
 ## What comes up
 
@@ -27,6 +33,34 @@ The bank API runs from source deliberately: the `bank-api` image deployed in the
 `nano-bank` cluster predates the finance specs, so it has neither the expanded GL
 chart nor `/api/v1/finance/*`. Redeploying that image would make the in-cluster
 service work too.
+
+## What "realistic" means here
+
+The seeded bank is calibrated so the ratios land where a real challenger bank's
+would. After a run you should see roughly:
+
+| Ratio | Demo | Real banks |
+|---|---|---|
+| Leverage (equity/assets) | ~10% | 6–10% |
+| Loan-to-deposit | ~73% | 70–90% |
+| Efficiency ratio | ~60% | 55–70% |
+| Cost of funds | 2.50% | 2–3% |
+| Yield on earning assets | ~8.9% | 6–9% |
+| RWA capital ratio | ~15% | 12–18% |
+| NIM | ~6% | 2–4% (higher when card-heavy) |
+| RAROC | ~15% | hurdle 12–20% |
+
+**ROA (~2%) and ROE (~21%) read high on purpose.** The ledger has no loan-loss
+provision account, so net income is *pre-provision* — credit cost enters through
+RAROC's expected loss instead. Net of the $9.1k expected loss, ROE is ~10%,
+which is the textbook figure. `raroc()` returns a `basis` field saying this, so
+the CFO explains it correctly rather than guessing.
+
+Two things make the numbers honest rather than hand-set: interest is derived
+from annual rates over the real ACT/365 day count, and the opening balance sheet
+is closed as the **prior** period so averages (earning assets, deposits) are
+computed against a real opening book. Without that opening snapshot every
+average is halved and NIM / cost of funds come out roughly double.
 
 ## What gets seeded
 
