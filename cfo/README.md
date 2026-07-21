@@ -49,6 +49,15 @@ The risk model behind RAROC is tuned on the **finance** side via `RISK_WEIGHT_*`
 `kubectl apply -f cfo/k8s/cfo.yaml` — reuses the existing `nano-agent-secrets`
 secret for `OLLAMA_API_KEY` (created by `agent/k8s/deploy.sh`).
 
+## Demo
+
+`cfo/demo/` brings the whole stack up and seeds a bank full of events to talk
+about — see `cfo/demo/README.md`:
+
+```bash
+bash cfo/demo/run-cfo-stack.sh && bash cfo/demo/seed-demo-bank.sh
+```
+
 ## Smoke
 
 `bash cfo/verify-cfo.sh` with the stack up (once per `CORE_BACKEND`).
