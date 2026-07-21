@@ -2,8 +2,32 @@
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { decodeJwtExpiry } from "../lib/jwt";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
+
+interface SessionTokens {
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+}
+
+async function setSessionCookies({ access_token, refresh_token, expires_in }: SessionTokens) {
+  const cookieStore = await cookies();
+  cookieStore.set("access_token", access_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+    maxAge: expires_in,
+  });
+  cookieStore.set("refresh_token", refresh_token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    path: "/",
+  });
+}
 
 export interface SignUpResult {
   success: boolean;
@@ -106,27 +130,54 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
     };
   }
 
-  const { access_token, refresh_token, expires_in } = data;
-
-  const cookieStore = await cookies();
-  cookieStore.set("access_token", access_token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-    maxAge: expires_in,
-  });
-  cookieStore.set("refresh_token", refresh_token, {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === "production",
-    sameSite: "lax",
-    path: "/",
-  });
+  await setSessionCookies(data);
 
   return {
     success: true,
     message: "Successfully signed in!",
   };
+}
+
+export interface RefreshResult {
+  success: boolean;
+  expiresAt?: number;
+}
+
+/** Exchanges the refresh_token cookie for a new access/refresh pair. Called by
+ * TokenCountdown once the access token's exp passes. On failure the session is
+ * truly over (refresh token missing, expired, or already used) — cookies are
+ * cleared and the caller should send the user back to sign in. */
+export async function refreshSessionAction(): Promise<RefreshResult> {
+  const cookieStore = await cookies();
+  const refreshToken = cookieStore.get("refresh_token")?.value;
+
+  if (!refreshToken) {
+    return { success: false };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/auth/refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+      cache: "no-store",
+    });
+  } catch (error) {
+    console.error("Token refresh request failed:", error);
+    return { success: false };
+  }
+
+  if (!response.ok) {
+    cookieStore.delete("access_token");
+    cookieStore.delete("refresh_token");
+    return { success: false };
+  }
+
+  const data = await response.json();
+  await setSessionCookies(data);
+
+  return { success: true, expiresAt: decodeJwtExpiry(data.access_token) ?? undefined };
 }
 
 export async function logoutAction(): Promise<void> {

@@ -1,26 +1,54 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { refreshSessionAction } from "../actions/auth";
 
 function formatRemaining(ms: number): string {
-  if (ms <= 0) return "expired";
-  const totalSeconds = Math.floor(ms / 1000);
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
 export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
+  const router = useRouter();
+  const [expiry, setExpiry] = useState(expiresAt);
   const [remaining, setRemaining] = useState<number | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const refreshInFlight = useRef(false);
 
   useEffect(() => {
-    const tick = () => setRemaining(expiresAt * 1000 - Date.now());
+    const tick = async () => {
+      const msLeft = expiry * 1000 - Date.now();
+      setRemaining(msLeft);
+
+      if (msLeft <= 0 && !refreshInFlight.current) {
+        refreshInFlight.current = true;
+        setIsRefreshing(true);
+
+        const result = await refreshSessionAction();
+
+        if (result.success && result.expiresAt) {
+          setExpiry(result.expiresAt);
+          setIsRefreshing(false);
+          refreshInFlight.current = false;
+        } else {
+          router.push("/auth/signin");
+        }
+      }
+    };
+
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [expiresAt]);
+  }, [expiry, router]);
 
   if (remaining === null) return null;
+
+  if (isRefreshing) {
+    return <span className="text-slate-400">Refreshing session…</span>;
+  }
 
   return (
     <span className={remaining <= 0 ? "text-red-400" : "text-slate-400"}>
