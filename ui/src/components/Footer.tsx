@@ -1,3 +1,5 @@
+import Link from "next/link";
+
 interface FooterLink {
   label: string;
   href: string;
@@ -8,8 +10,8 @@ interface FooterProps {
 }
 
 const DEFAULT_LINKS: FooterLink[] = [
-  { label: "Privacy Policy", href: "#" },
-  { label: "Terms of Service", href: "#" },
+  { label: "Privacy Policy", href: "/privacy" },
+  { label: "Terms of Service", href: "/terms" },
 ];
 
 export default function Footer({ links = DEFAULT_LINKS }: FooterProps) {
@@ -18,9 +20,9 @@ export default function Footer({ links = DEFAULT_LINKS }: FooterProps) {
       <p className="text-xs text-slate-500">&copy; {new Date().getFullYear()} Nano-Bank. All rights reserved.</p>
       <div className="flex gap-6 text-xs text-slate-500">
         {links.map((link) => (
-          <a key={link.label} href={link.href} className="hover:text-slate-300 transition-colors">
+          <Link key={link.label} href={link.href} className="hover:text-slate-300 transition-colors">
             {link.label}
-          </a>
+          </Link>
         ))}
       </div>
     </footer>

@@ -97,9 +97,8 @@ export default function Home() {
 
       <Footer
         links={[
-          { label: "Privacy Policy", href: "#" },
-          { label: "Terms of Service", href: "#" },
-          { label: "Contact", href: "#" },
+          { label: "Privacy Policy", href: "/privacy" },
+          { label: "Terms of Service", href: "/terms" },          
         ]}
       />
     </div>
