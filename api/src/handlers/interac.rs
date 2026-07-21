@@ -302,6 +302,13 @@ struct ClaimedNotification {
 /// The delivery-channel seam. Today it just logs — this is where a real email/SMS
 /// provider plugs in. Returns `Err(reason)` on a delivery failure so the drainer
 /// records it and retries (up to the attempt cap).
+///
+/// **Delivery is at-least-once.** The claim, the send, and the `delivered = TRUE`
+/// mark are three separate statements, so a crash (or a failed mark) after a
+/// successful send re-delivers on the next tick. That is invisible while this is a
+/// stub, but a real provider must dedupe: pass `notification_id` as the
+/// provider-side **idempotency key** so a retry collapses into the original send
+/// instead of a second "your e-Transfer arrived" message.
 async fn deliver_notification(n: &ClaimedNotification) -> Result<(), String> {
     tracing::info!(
         notification_id = %n.notification_id,

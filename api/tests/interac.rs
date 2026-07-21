@@ -481,13 +481,25 @@ async fn seed_etransfer(db: &sqlx::PgPool, handle: &str) -> Uuid {
     .unwrap()
 }
 
-async fn seed_notification(db: &sqlx::PgPool, etransfer_id: Uuid, handle: &str) -> Uuid {
+/// Seeds an outbox row at a given attempt count. `attempts` is set in the *same*
+/// statement as the insert on purpose: seeding at 0 and bumping afterwards leaves a
+/// window in which a concurrent drainer (a sibling test, or the every-5-minute
+/// CronJob against the same database) can claim and deliver the row before it is
+/// marked exhausted.
+async fn seed_notification(
+    db: &sqlx::PgPool,
+    etransfer_id: Uuid,
+    handle: &str,
+    attempts: i32,
+) -> Uuid {
     sqlx::query_scalar(
-        "INSERT INTO interac_notifications (etransfer_id, handle_value, kind, message) \
-         VALUES ($1, $2, 'deposit_completed', 'test drain') RETURNING notification_id",
+        "INSERT INTO interac_notifications \
+           (etransfer_id, handle_value, kind, message, delivery_attempts) \
+         VALUES ($1, $2, 'deposit_completed', 'test drain', $3) RETURNING notification_id",
     )
     .bind(etransfer_id)
     .bind(handle)
+    .bind(attempts)
     .fetch_one(db)
     .await
     .unwrap()
@@ -516,17 +528,12 @@ async fn flush_notifications_delivers_fresh_and_dead_letters_exhausted() {
     // Fresh, deliverable.
     let h_fresh = format!("drain-{}@nano.test", rnd());
     let et_fresh = seed_etransfer(&db, &h_fresh).await;
-    let fresh = seed_notification(&db, et_fresh, &h_fresh).await;
+    let fresh = seed_notification(&db, et_fresh, &h_fresh, 0).await;
 
-    // Exhausted its retry budget.
+    // Exhausted its retry budget — born at the cap, never claimable.
     let h_dead = format!("dead-{}@nano.test", rnd());
     let et_dead = seed_etransfer(&db, &h_dead).await;
-    let dead = seed_notification(&db, et_dead, &h_dead).await;
-    sqlx::query("UPDATE interac_notifications SET delivery_attempts = 5 WHERE notification_id = $1")
-        .bind(dead)
-        .execute(&db)
-        .await
-        .unwrap();
+    let dead = seed_notification(&db, et_dead, &h_dead, 5).await;
 
     let tok = service_token(&c).await;
     let resp = flush_notifications(&c, &tok).await;

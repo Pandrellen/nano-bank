@@ -81,9 +81,11 @@ trait.
 **Interac e-Transfer** (`handlers/interac.rs`, `rails/interac.rs`): a separate
 synthetic customer `interac@nano.bank` owns `INTERAC_CLEARING` (chequing) and
 `INTERAC_SETTLEMENT` (savings), $1T overdraft, bootstrapped at startup like the
-card rails' system accounts. Three auth planes: customer (`/etransfers`,
-`/autodeposit`), service-token network (`/network/*`), service-token admin
-(`/admin/sweep-expired`, `/admin/flush-notifications`). The notification outbox
+card rails' system accounts. Auth planes: customer (`/etransfers`,
+`/autodeposit`) vs service token — that split is the enforced one
+(`AuthenticatedService` checks only `role == Service`). Network (`/network/*`)
+and admin (`/admin/sweep-expired`, `/admin/flush-notifications`) are a naming
+convention over the *same* service credential, not distinct ones. The notification outbox
 has a **drainer** on the admin plane (`flush_notifications`): it claims
 undelivered rows with `FOR UPDATE SKIP LOCKED` (the claim is an atomic
 `delivery_attempts += 1`, so there's no in-flight state to strand on a crash),
