@@ -103,6 +103,19 @@ def build_mcp(deps: Deps) -> FastMCP:
             days, RiskConfig.from_env()))
 
     @mcp.tool()
+    def provision_scenario(period: str, provision: str) -> dict:
+        """Restate a period's ROA/ROE as if a loan-loss provision were charged.
+
+        `provision` is a CAD amount. Use this for any "what if we provisioned
+        X" question — never work it out by hand, the reported returns are
+        annualised and a hand-rolled hypothetical will not be.
+        """
+        _, _, prior, days = _month_range(period)
+        return _stringify(metrics.provision_scenario(
+            deps.db.read_snapshot(period), deps.db.read_snapshot(prior),
+            days, RiskConfig.from_env(), Decimal(provision)))
+
+    @mcp.tool()
     def key_ratios(period: str) -> dict:
         """Key CFO ratios (ROA/ROE/efficiency/LDR/leverage/CoF/yield) for a period."""
         _, _, prior, days = _month_range(period)

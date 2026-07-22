@@ -154,6 +154,52 @@ def key_ratios(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dic
     }
 
 
+def provision_scenario(closing: dict, opening: dict, days: int,
+                       risk: RiskConfig, provision: Decimal) -> dict:
+    """What booking a loan-loss provision would do to the headline returns.
+
+    The ledger books no provision, so "what if we did" is a fair question — and
+    it is where hand arithmetic goes wrong. Reported ROA/ROE are annualised; a
+    hypothetical worked off the raw period income is ~12x too small and reads
+    as directly comparable. Both sides are annualised here, and the capital
+    base is the same one key_ratios uses (a provision lands in current
+    earnings, which the capital base excludes, so the denominator holds).
+    """
+    bs = reports.balance_sheet(closing)
+    ni = reports.income_statement(closing, opening)["net_income"]
+    ni_after = ni - provision
+
+    def ann(x: Decimal) -> Decimal:
+        return x * Decimal(365) / Decimal(days)
+
+    total_assets = bs["total_assets"]
+    capital_base = sum((v for k, v in bs["equity"].items()
+                        if k != "CurrentEarnings"), Decimal(0))
+    return {
+        "provision": provision,
+        "net_income": ni,
+        "net_income_after": ni_after,
+        "total_assets": total_assets,
+        # the provision sits as an allowance against the book
+        "total_assets_after": total_assets - provision,
+        "roa_before": _safe_div(ann(ni), total_assets),
+        "roa_after": _safe_div(ann(ni_after), total_assets - provision),
+        "roe_before": _safe_div(ann(ni), capital_base),
+        "roe_after": _safe_div(ann(ni_after), capital_base),
+        "period_days": days,
+        "units": {
+            "provision": f"CAD, charged in the {days}-day period",
+            "net_income": f"CAD, {days}-day period",
+            "net_income_after": f"CAD, {days}-day period",
+            "roa_before": "annual ratio", "roa_after": "annual ratio",
+            "roe_before": "annual ratio", "roe_after": "annual ratio",
+        },
+        "basis": ("hypothetical — no provision is booked in the ledger; this "
+                  "restates the period's returns as if `provision` had been "
+                  "charged, with both sides annualised the same way"),
+    }
+
+
 def financial_health(closing: dict, opening: dict, days: int,
                      risk: RiskConfig) -> dict:
     return {

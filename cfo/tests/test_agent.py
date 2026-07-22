@@ -58,3 +58,20 @@ def test_prompt_requires_naming_the_period_and_its_limits():
     p = cfo_agent.CFO_PROMPT.lower()
     assert "name the period" in p
     assert "monthly" in p
+
+
+def test_prompt_routes_hypotheticals_to_a_tool():
+    """Asked what a 1% provision would do, the CFO hand-computed the answer and
+    forgot to annualise it — ROE came out 11x too small, tabled beside the
+    correctly annualised current figure."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "provision_scenario" in p
+    assert "do not hand-roll" in p
+
+
+def test_prompt_is_honest_about_close_period():
+    """It claimed to take no actions while holding a tool that writes a GL
+    snapshot — and used it on request."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "close_period" in p
+    assert "no financial actions" in p

@@ -185,3 +185,40 @@ def test_expected_loss_rate_is_none_without_exposure():
     out = metrics.raroc({"CashReserves": D("100")}, {}, days=30, risk=RC)
     assert out["credit_exposure"] == D("0")
     assert out["expected_loss_rate"] is None
+
+
+def test_provision_scenario_annualises_both_sides():
+    """The reported ROA/ROE are annualised. Asked what a provision would do,
+    the agent computed the 'after' figures off the raw period income and put
+    them in the same table as the annualised 'before' — ROE came out 11x too
+    small. Both sides have to be annualised the same way."""
+    closing = {
+        "CashReserves": D("5000"), "CardReceivable": D("10000"),
+        "TreasuryPlacement": D("5000"), "CustomerDeposits": D("-16000"),
+        "Capital": D("-3000"),
+        "InterestIncome": D("-1000"), "InterestExpense": D("200"),
+        "OperatingExpense": D("100"), "FeeIncome": D("-50"),
+    }
+    opening = {"InterestIncome": D("0"), "InterestExpense": D("0"),
+               "OperatingExpense": D("0"), "FeeIncome": D("0")}
+    out = metrics.provision_scenario(closing, opening, days=30, risk=RC,
+                                     provision=D("100"))
+    assert out["provision"] == D("100")
+    assert out["net_income"] == D("750")
+    assert out["net_income_after"] == D("650")
+    # assets carry the allowance; the capital base does not move because a
+    # provision lands in current earnings, which key_ratios already excludes
+    assert out["roa_after"] == _ann(D("650")) / D("19900")
+    assert out["roe_after"] == _ann(D("650")) / D("3000")
+    assert out["roa_before"] == _ann(D("750")) / D("20000")
+    assert out["roe_before"] == _ann(D("750")) / D("3000")
+    assert "annual" in out["units"]["roa_after"]
+
+
+def test_provision_scenario_can_turn_returns_negative():
+    closing = {"CashReserves": D("1000"), "Capital": D("-500"),
+               "InterestIncome": D("-100")}
+    out = metrics.provision_scenario(closing, {}, days=30, risk=RC,
+                                     provision=D("400"))
+    assert out["net_income_after"] == D("-300")
+    assert out["roa_after"] < 0
