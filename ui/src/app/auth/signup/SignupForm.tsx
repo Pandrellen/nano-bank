@@ -3,7 +3,7 @@
 import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { signUpAction } from "../../../actions/auth";
+import { signUpAction } from "@/actions/auth";
 
 export default function SignupForm() {
   const router = useRouter();

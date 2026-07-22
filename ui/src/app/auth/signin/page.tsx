@@ -1,7 +1,7 @@
 import Link from "next/link";
 import SigninForm from "./SigninForm";
-import Header from "../../../components/Header";
-import Footer from "../../../components/Footer";
+import Header from "@/components/Header";
+import Footer from "@/components/Footer";
 
 export default async function Page() {
   return (

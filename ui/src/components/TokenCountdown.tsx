@@ -27,7 +27,13 @@ export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
         refreshInFlight.current = true;
         setIsRefreshing(true);
 
-        const result = await refreshSessionAction();
+        let result;
+        try {
+          result = await refreshSessionAction();
+        } catch (error) {
+          console.error("Token refresh failed:", error);
+          result = { success: false as const };
+        }
 
         if (result.success && result.expiresAt) {
           setExpiry(result.expiresAt);

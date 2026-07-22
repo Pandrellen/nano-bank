@@ -1,9 +1,9 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import Header from "../../components/Header";
-import Footer from "../../components/Footer";
-import TokenCountdown from "../../components/TokenCountdown";
-import { decodeJwtExpiry } from "../../lib/jwt";
+import Header from "@/components/Header";
+import Footer from "@/components/Footer";
+import TokenCountdown from "@/components/TokenCountdown";
+import { decodeJwtExpiry } from "@/lib/jwt";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
 
