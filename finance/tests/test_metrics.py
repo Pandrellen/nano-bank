@@ -168,3 +168,20 @@ def test_economic_capital_flags_roles_that_fell_back_to_the_default():
     ec = metrics.economic_capital({"Receivable": D("1000")}, RC)
     assert ec["assumed_weight_roles"] == ["Receivable"]
     assert ec["risk_weights"]["Receivable"] == RC.default_asset_weight
+
+
+def test_raroc_reports_the_credit_exposure_and_loss_rate():
+    """Otherwise the only way to say 'expected loss is ~1.8% of the book' is to
+    divide by hand — which is exactly the arithmetic callers are told not to do."""
+    out = metrics.raroc(_assets(), {}, days=30, risk=RC)
+    # exposure = the roles carrying a loss rate: 10000 + 4000 + 6000
+    assert out["credit_exposure"] == D("20000")
+    assert out["expected_loss"] == D("470.000")
+    assert out["expected_loss_rate"] == D("470.000") / D("20000")
+    assert "annual ratio" in out["units"]["expected_loss_rate"]
+
+
+def test_expected_loss_rate_is_none_without_exposure():
+    out = metrics.raroc({"CashReserves": D("100")}, {}, days=30, risk=RC)
+    assert out["credit_exposure"] == D("0")
+    assert out["expected_loss_rate"] is None

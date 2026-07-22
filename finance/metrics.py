@@ -50,12 +50,20 @@ def expected_loss(snapshot: dict, risk: RiskConfig) -> Decimal:
     return total
 
 
+def credit_exposure(snapshot: dict, risk: RiskConfig) -> Decimal:
+    """The balances expected loss is charged against — the denominator behind
+    any 'expected loss is x% of the book' statement."""
+    return sum((snapshot.get(role, Decimal(0)) for role in risk.loss_rates),
+               Decimal(0))
+
+
 def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
     inc = reports.income_statement(closing, opening)
     ni = inc["net_income"]
     # Annualise multiply-first (x * 365 / days) so exact figures stay exact.
     ni_ann = ni * Decimal(365) / Decimal(days)
     el = expected_loss(closing, risk)
+    exposure = credit_exposure(closing, risk)
     ec = economic_capital(closing, risk)
     rar = ni_ann - el
     return {
@@ -67,6 +75,8 @@ def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
         # rescale by hand — and netting the *annual* expected loss against one
         # month of income turns a profitable month into a fake loss.
         "expected_loss_period": el * Decimal(days) / Decimal(365),
+        "credit_exposure": exposure,
+        "expected_loss_rate": _safe_div(el, exposure),
         "risk_adjusted_return": rar,
         "economic_capital": ec["economic_capital"],
         "total_rwa": ec["total_rwa"],
@@ -81,6 +91,8 @@ def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
             "net_income_annualized": "CAD, annual",
             "expected_loss": "CAD, annual",
             "expected_loss_period": f"CAD, {days}-day period",
+            "credit_exposure": "CAD, point-in-time",
+            "expected_loss_rate": "annual ratio of expected_loss to credit_exposure",
             "risk_adjusted_return": "CAD, annual",
             "economic_capital": "CAD, point-in-time",
             "total_rwa": "CAD, point-in-time",

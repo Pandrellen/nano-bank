@@ -40,7 +40,7 @@ def test_prompt_refuses_unverified_premises():
     p = cfo_agent.CFO_PROMPT.lower()
     assert "unverified claim" in p
     assert "cannot see it" in p
-    assert "list_periods does not offer" in p
+    assert "list_periods does not cover" in p
 
 
 def test_prompt_pins_units_discipline():
@@ -49,3 +49,12 @@ def test_prompt_pins_units_discipline():
     p = cfo_agent.CFO_PROMPT.lower()
     assert "expected_loss_period" in p
     assert "annual figure" in p
+
+
+def test_prompt_requires_naming_the_period_and_its_limits():
+    """Snapshots are monthly. Asked about 'last quarter' the CFO answered from
+    a single month without saying so — quietly narrowing the question is as
+    misleading as answering it wrong."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "name the period" in p
+    assert "monthly" in p
