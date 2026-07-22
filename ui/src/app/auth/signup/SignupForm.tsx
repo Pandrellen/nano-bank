@@ -45,6 +45,7 @@ export default function SignupForm() {
             type="text"
             required
             placeholder="John"
+            autoComplete="given-name"
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500"
           />
         </div>
@@ -59,6 +60,7 @@ export default function SignupForm() {
             type="text"
             required
             placeholder="Doe"
+            autoComplete="family-name"
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500"
           />
         </div>
@@ -75,6 +77,7 @@ export default function SignupForm() {
           type="email"
           required
           placeholder="john.doe@example.com"
+          autoComplete="email"
           className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500"
         />
       </div>
@@ -90,6 +93,7 @@ export default function SignupForm() {
           type="tel"
           required
           placeholder="+1 (555) 000-0000"
+          autoComplete="mobile-tel"
           className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500"
         />
       </div>
@@ -136,6 +140,7 @@ export default function SignupForm() {
             type={showPassword ? "text" : "password"}
             required
             placeholder="••••••••"
+            autoComplete="new-password"
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500 pr-10"
           />
           <button

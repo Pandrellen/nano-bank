@@ -1,5 +1,10 @@
 import Link from "next/link";
 import SigninForm from "./SigninForm";
+import { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: 'Nano-Bank - Sign In',
+};
 
 export default async function Page() {
   return (

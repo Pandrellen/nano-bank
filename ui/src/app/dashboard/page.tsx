@@ -1,6 +1,11 @@
 import TokenCountdown from "@/components/TokenCountdown";
 import { decodeJwtExpiry } from "@/lib/jwt";
 import { requireSession } from "@/lib/session";
+import { Metadata } from 'next';
+
+export const metadata: Metadata = {
+  title: 'Nano-Bank - Dashboard',
+};
 
 export default async function Page() {
     const { accessToken, profile } = await requireSession();
