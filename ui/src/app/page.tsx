@@ -1,23 +1,9 @@
 import Link from "next/link";
-import Header from "@/components/Header";
-import Footer from "@/components/Footer";
+
 
 export default function Home() {
   return (
-    <div className="relative min-h-screen flex flex-col justify-between bg-nanobank-blue-deep text-white overflow-hidden font-sans">
-      {/* Background Gradient Orbs and Grid */}
-      <div className="absolute inset-0 z-0">
-        {/* Ambient background grid */}
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,#0c2b3e_1px,transparent_1px),linear-gradient(to_bottom,#0c2b3e_1px,transparent_1px)] bg-[size:4rem_4rem] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_0%,#000_70%,transparent_100%)] opacity-60"></div>
-        
-        {/* Glow effects */}
-        <div className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] rounded-full bg-nanobank-blue-sky/20 blur-[120px]"></div>
-        <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-nanobank-orange-deep/10 blur-[120px]"></div>
-      </div>
 
-      <Header />
-
-      {/* Main Hero Section */}
       <main className="relative z-10 flex-1 flex items-center">
         <div className="w-full max-w-7xl mx-auto px-6 py-12 md:py-20 grid md:grid-cols-12 gap-12 items-center">
           {/* Hero Content */}
@@ -95,12 +81,5 @@ export default function Home() {
         </div>
       </main>
 
-      <Footer
-        links={[
-          { label: "Privacy Policy", href: "/privacy" },
-          { label: "Terms of Service", href: "/terms" },          
-        ]}
-      />
-    </div>
   );
 }
