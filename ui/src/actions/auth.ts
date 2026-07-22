@@ -6,13 +6,26 @@ import { decodeJwtExpiry } from "@/lib/jwt";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
 
-interface SessionTokens {
+/** Mirrors the API's `{ "error": { "code", "message", "details" } }` envelope
+ * (see api/src/errors/mod.rs — every AppError variant serializes to this shape). */
+interface ApiErrorBody {
+  error: {
+    code: string;
+    message: string;
+    details: string;
+  };
+}
+
+/** Mirrors the API's `LoginResponse` (api/src/models/auth.rs), returned by both
+ * `/auth/login` and `/auth/refresh`. */
+interface LoginResponseBody {
   access_token: string;
   refresh_token: string;
+  token_type: string;
   expires_in: number;
 }
 
-async function setSessionCookies({ access_token, refresh_token, expires_in }: SessionTokens) {
+async function setSessionCookies({ access_token, refresh_token, expires_in }: LoginResponseBody) {
   const cookieStore = await cookies();
   cookieStore.set("access_token", access_token, {
     httpOnly: true,
@@ -74,12 +87,11 @@ export async function signUpAction(formData: FormData): Promise<SignUpResult> {
     };
   }
 
-  const data = await response.json();
-
   if (!response.ok) {
+    const errorBody: ApiErrorBody = await response.json();
     return {
       success: false,
-      message: data?.error?.message || "Unable to create account.",
+      message: errorBody.error.message || "Unable to create account.",
     };
   }
 
@@ -121,15 +133,15 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
     };
   }
 
-  const data = await response.json();
-
   if (!response.ok) {
+    const errorBody: ApiErrorBody = await response.json();
     return {
       success: false,
-      message: data?.error?.message || "Invalid email or password.",
+      message: errorBody.error.message || "Invalid email or password.",
     };
   }
 
+  const data: LoginResponseBody = await response.json();
   await setSessionCookies(data);
 
   return {
@@ -174,7 +186,7 @@ export async function refreshSessionAction(): Promise<RefreshResult> {
     return { success: false };
   }
 
-  const data = await response.json();
+  const data: LoginResponseBody = await response.json();
   await setSessionCookies(data);
 
   return { success: true, expiresAt: decodeJwtExpiry(data.access_token) ?? undefined };
