@@ -1,41 +1,9 @@
-import { cookies } from "next/headers";
-import { redirect } from "next/navigation";
 import TokenCountdown from "@/components/TokenCountdown";
 import { decodeJwtExpiry } from "@/lib/jwt";
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
-
-interface CustomerProfile {
-    first_name: string;
-    last_name: string;
-    email: string;
-}
+import { requireSession } from "@/lib/session";
 
 export default async function Page() {
-    const cookieStore = await cookies();
-    const accessToken = cookieStore.get("access_token")?.value;
-
-    if (!accessToken) {
-        redirect("/auth/signin");
-    }
-
-    let profile: CustomerProfile | null = null;
-    try {
-        const response = await fetch(`${API_BASE_URL}/api/v1/customers/profile`, {
-            headers: { Authorization: `Bearer ${accessToken}` },
-            cache: "no-store",
-        });
-        if (response.ok) {
-            profile = await response.json();
-        }
-    } catch (error) {
-        console.error("Failed to verify session:", error);
-    }
-
-    if (!profile) {
-        redirect("/auth/signin");
-    }
-
+    const { accessToken, profile } = await requireSession();
     const tokenExpiry = decodeJwtExpiry(accessToken);
 
     return (
