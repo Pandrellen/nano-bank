@@ -6,7 +6,8 @@ A Next.js (App Router) frontend for the nano-bank API.
 
 - `/` — splash page.
 - `/auth/signup`, `/auth/signin` — customer registration and login forms.
-- `/dashboard` — protected; requires a valid session, otherwise redirects to `/auth/signin`.
+- `/dashboard` — protected; requires a valid session, otherwise redirects to `/auth/signin`. Shows a
+  skeleton (`loading.tsx`) while the session check is in flight.
 - `/privacy`, `/terms` — static Privacy Policy / Terms of Service pages.
 - `/health` — pings the API's `/health` endpoint.
 
@@ -22,6 +23,9 @@ Sign-up, sign-in, logout, and token refresh are Next.js server actions
 
 - On sign-in, the API's `access_token` / `refresh_token` are stored as
   `httpOnly` cookies.
+- `src/proxy.ts` is a cheap edge-level gate on `/dashboard/:path*`: it bounces
+  requests with no `access_token` cookie at all before they reach the page.
+  This is a presence check only, not authoritative.
 - `/dashboard` verifies the `access_token` server-side against
   `GET /api/v1/customers/profile` on every load, redirecting to `/auth/signin`
   if it's missing or rejected.
@@ -54,3 +58,8 @@ npm run dev
 
 3. Open browser at `http://localhost:3000`
 4. Visit `/health` to confirm the API is reachable, or go to `/auth/signup` to create an account and sign in.
+
+## Notes
+1. Multi-tab is silently broken. If a user has the dashboard open in two tabs, whichever tab refreshes first invalidates the token the other tab is about to send, and that second tab gets bounced to sign-in even though the session is fine.
+
+2. Zero tests in "ui" currently. Look to add some Playwright tests for the golden path (sign up → sign in → dashboard shows countdown → logout) would be valuable at a later stage.
