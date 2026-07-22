@@ -87,8 +87,12 @@ def build_mcp(deps: Deps) -> FastMCP:
         inc = reports.income_statement(deps.db.read_snapshot(period),
                                        deps.db.read_snapshot(prior))
         interchange = inc["income"].get("InterchangeIncome", Decimal(0))
+        # Hand the GL's net income in so the report reconciles itself: the
+        # segments come from the operational tables and the income statement
+        # from the GL snapshot, and the two can drift apart silently.
         return _stringify(reports.segment_pnl(
-            deps.db.accruals(start, end), deps.db.fees(start, end), interchange))
+            deps.db.accruals(start, end), deps.db.fees(start, end), interchange,
+            gl_net_income=inc["net_income"]))
 
     @mcp.tool()
     def raroc(period: str) -> dict:

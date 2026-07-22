@@ -92,3 +92,20 @@ Tunable: `CUSTOMERS`, `ACCRUAL_DAYS`, `PERIOD`, `API`.
 
 The CFO is read-only: it will analyse and recommend, but it cannot move money or
 post entries.
+
+### Segment P&L will not tie to the income statement
+
+`segment_pnl` reads nano-bank's **operational** tables (`interest_accruals`,
+`transactions`); every other report reads the **GL snapshot** from the core. The
+reset here clears the GL only — nano-bank's own Postgres keeps its customers,
+mandates and rail history, and with them every fee and accrual written by past
+test-harness runs. So the segments carry activity the freshly-seeded GL never
+booked: a demo whose GL nets $1,448 can show $10,918 of segment income, most of
+it thousands of stale $4 maintenance fees.
+
+That is a property of the reset scope, not a bug to seed around. `segment_pnl`
+reconciles itself against the income statement and returns the gap, so the CFO
+reports the discrepancy instead of ranking product lines on numbers that do not
+tie. To see them agree, you would have to wipe nano-bank's transaction history
+too — which costs you the rail and customer data the rest of the repo tests
+against.
