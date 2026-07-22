@@ -3,8 +3,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { decodeJwtExpiry } from "@/lib/jwt";
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8081";
+import { API_BASE_URL } from "@/lib/config";
 
 /** Mirrors the API's `{ "error": { "code", "message", "details" } }` envelope
  * (see api/src/errors/mod.rs — every AppError variant serializes to this shape). */
