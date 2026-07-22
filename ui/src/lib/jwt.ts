@@ -1,3 +1,5 @@
+import "server-only";
+
 /** Reads the `exp` claim (unix seconds) out of a JWT without verifying its signature — for display only, never for auth decisions. */
 export function decodeJwtExpiry(token: string): number | null {
   const payload = token.split(".")[1];
