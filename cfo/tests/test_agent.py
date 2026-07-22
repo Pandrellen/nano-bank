@@ -31,3 +31,21 @@ def test_ask_returns_answer_and_thread():
     assert out["thread_id"] == "t1"
     assert "RAROC" in out["answer"]
     assert isinstance(out["trace"], list)
+
+
+def test_prompt_refuses_unverified_premises():
+    """The CFO's worst failure mode is completing a narrative: given a made-up
+    NPL ratio it will happily explain what is driving it. The prompt has to
+    make a supplied figure a claim to check, not a fact to build on."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "unverified claim" in p
+    assert "cannot see it" in p
+    assert "list_periods does not offer" in p
+
+
+def test_prompt_pins_units_discipline():
+    """expected_loss is annual; netting it against a month of net income turns
+    a profitable month into a fake loss."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "expected_loss_period" in p
+    assert "annual figure" in p

@@ -19,15 +19,27 @@ def economic_capital(snapshot: dict, risk: RiskConfig) -> dict:
     Assets are driven off the snapshot rather than off the weight table, so a
     role nobody configured (say a new receivable) falls back to the default
     weight instead of silently counting as risk-free.
+
+    The weights used come back with the numbers, and any role that fell through
+    to `default_asset_weight` is named: a fallback weight is an assumption, not
+    a policy, and a caller reporting it as bank policy would be overstating how
+    deliberate the capital charge is.
     """
     rwa: dict[str, Decimal] = {}
+    used: dict[str, Decimal] = {}
+    assumed: list[str] = []
     for role in set(snapshot) | set(risk.risk_weights):
         if roles.STATEMENT_LINE.get(role) != "asset":
             continue
-        weight = risk.risk_weights.get(role, risk.default_asset_weight)
+        weight = risk.risk_weights.get(role)
+        if weight is None:
+            weight = risk.default_asset_weight
+            assumed.append(role)
+        used[role] = weight
         rwa[role] = (snapshot.get(role, Decimal(0)) * weight).quantize(Decimal("0.01"))
     total = sum(rwa.values(), Decimal(0))
     return {"rwa": rwa, "total_rwa": total,
+            "risk_weights": used, "assumed_weight_roles": sorted(assumed),
             "economic_capital": (total * risk.target_ratio).quantize(Decimal("0.01"))}
 
 
@@ -50,17 +62,41 @@ def raroc(closing: dict, opening: dict, days: int, risk: RiskConfig) -> dict:
         "net_income": ni,
         "net_income_annualized": ni_ann,
         "expected_loss": el,
+        # The period-equivalent credit cost, precomputed. Without it a reader
+        # wanting to compare credit cost against the period's net income has to
+        # rescale by hand — and netting the *annual* expected loss against one
+        # month of income turns a profitable month into a fake loss.
+        "expected_loss_period": el * Decimal(days) / Decimal(365),
         "risk_adjusted_return": rar,
         "economic_capital": ec["economic_capital"],
         "total_rwa": ec["total_rwa"],
         "rwa": ec["rwa"],
+        "risk_weights": ec["risk_weights"],
+        "assumed_weight_roles": ec["assumed_weight_roles"],
+        "period_days": days,
+        # Periodicity travels with the figures: mixing an annual number into a
+        # monthly comparison is the easiest way to misread this whole bundle.
+        "units": {
+            "net_income": f"CAD, {days}-day period",
+            "net_income_annualized": "CAD, annual",
+            "expected_loss": "CAD, annual",
+            "expected_loss_period": f"CAD, {days}-day period",
+            "risk_adjusted_return": "CAD, annual",
+            "economic_capital": "CAD, point-in-time",
+            "total_rwa": "CAD, point-in-time",
+            "rwa": "CAD, point-in-time, per role",
+            "raroc": "annual ratio",
+        },
         "raroc": _safe_div(rar, ec["economic_capital"]),
         # The GL has no loan-loss provision account, so credit cost is NOT in
         # net income; it enters here as expected loss. Consumers (the CFO agent
         # included) must not describe ROA/ROE as after-credit-loss measures.
         "basis": ("net income is pre-provision — the ledger books no loan-loss "
                   "provision, so expected credit loss is deducted here in RAROC "
-                  "and is NOT reflected in net income, ROA or ROE"),
+                  "and is NOT reflected in net income, ROA or ROE. expected_loss "
+                  "is an ANNUAL figure netted against net_income_annualized; to "
+                  "state credit cost for this period use expected_loss_period, "
+                  "never expected_loss"),
     }
 
 

@@ -130,3 +130,41 @@ def test_raroc_declares_its_provisioning_basis():
     and RAROC — not ROE — is where credit cost lands. Say so in the output."""
     out = metrics.raroc({"LoansReceivable": D("1000")}, {}, days=30, risk=RC)
     assert "pre-provision" in out["basis"]
+
+
+def test_raroc_labels_the_periodicity_of_every_figure():
+    """net_income covers the period; expected_loss is annual. A reader that
+    nets one against the other turns a profitable month into a fake loss, so
+    the units have to travel with the numbers."""
+    out = metrics.raroc({"LoansReceivable": D("1000")}, {}, days=31, risk=RC)
+    units = out["units"]
+    assert set(units) >= {"net_income", "net_income_annualized", "expected_loss",
+                          "risk_adjusted_return", "economic_capital", "raroc"}
+    assert "31-day period" in units["net_income"]
+    assert "annual" in units["expected_loss"]
+    assert out["period_days"] == 31
+
+
+def test_raroc_offers_the_period_equivalent_expected_loss():
+    """So nobody has to rescale the annual figure by hand to compare it with
+    the period's net income."""
+    out = metrics.raroc({"LoansReceivable": D("1000")}, {}, days=73, risk=RC)
+    assert out["expected_loss"] == D("15.000")            # 1000 * 0.015
+    assert out["expected_loss_period"] == D("15.000") * D("73") / D("365")
+
+
+def test_economic_capital_reports_the_weights_it_used():
+    ec = metrics.economic_capital(_assets(), RC)
+    assert ec["risk_weights"]["CardReceivable"] == D("0.75")
+    assert ec["assumed_weight_roles"] == []
+
+
+def test_economic_capital_flags_roles_that_fell_back_to_the_default():
+    """A weight nobody configured is an assumption, not a policy — the caller
+    must be able to tell the two apart. `Receivable` is a real instance: it is
+    a known asset with no entry in the weight table, and it was one of the
+    roles that silently vanished from RWA before assets were driven off the
+    snapshot."""
+    ec = metrics.economic_capital({"Receivable": D("1000")}, RC)
+    assert ec["assumed_weight_roles"] == ["Receivable"]
+    assert ec["risk_weights"]["Receivable"] == RC.default_asset_weight
