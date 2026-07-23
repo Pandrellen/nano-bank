@@ -9,6 +9,7 @@ export default function SignupForm() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [showSin, setShowSin] = useState(false);
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -117,14 +118,24 @@ export default function SignupForm() {
           <label htmlFor="sin" className="text-xs font-semibold tracking-wide text-slate-300">
             SIN / SSN
           </label>
-          <input
-            id="sin"
-            name="sin"
-            type="text"
-            required
-            placeholder="000-000-000"
-            className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500"
-          />
+          <div className="relative">
+            <input
+              id="sin"
+              name="sin"
+              type={showSin ? "text" : "password"}
+              required
+              placeholder="123456789"
+              autoComplete="off"
+              className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500 pr-10"
+            />
+            <button
+              type="button"
+              onClick={() => setShowSin(!showSin)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 text-xs font-medium focus:outline-none select-none"
+            >
+              {showSin ? "Hide" : "Show"}
+            </button>
+          </div>
         </div>
       </div>
 

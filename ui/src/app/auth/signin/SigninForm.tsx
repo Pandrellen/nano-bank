@@ -55,9 +55,7 @@ export default function SigninForm() {
           <label htmlFor="password" className="text-xs font-semibold tracking-wide text-slate-300">
             Password
           </label>
-          <a href="#" className="text-xs text-nanobank-blue-sky hover:underline">
-            Forgot password?
-          </a>
+          {/* Placeholder for a Forgot Password link */}
         </div>
         <div className="relative">
           <input
