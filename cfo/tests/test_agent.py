@@ -142,3 +142,13 @@ def test_ask_does_not_revise_when_all_grounded():
     assert fake.calls == 1                       # no revision
     assert out["verification"]["revised"] is False
     assert out["verification"]["ungrounded"] == []
+
+
+def test_prompt_distinguishes_direct_from_converted_values():
+    """A tool returns NIM as the ratio 0.0628; reporting '6.28%' is a faithful
+    conversion, not a value read verbatim from the field. The CFO must not
+    overstate provenance in either direction."""
+    p = cfo_agent.CFO_PROMPT.lower()
+    assert "verbatim" in p
+    assert "convert" in p        # matches "converted"/"conversion"
+    assert "ratio" in p and "percent" in p
