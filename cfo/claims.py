@@ -56,53 +56,64 @@ _OFFER = re.compile(
     r"|i can (?:close|run|capture))\b",
     re.I)
 
-# Metrics no tool provides. label (regex-safe substring) -> shown name.
-_PHANTOMS = {
-    "liquidity coverage ratio": "liquidity coverage ratio",
-    "lcr": "LCR",
-    "net stable funding ratio": "net stable funding ratio",
-    "nsfr": "NSFR",
-    "npl ratio": "NPL ratio",
-    "non-performing loan": "non-performing loan",
-    "non performing loan": "non-performing loan",
-    "npl": "NPL",
+# Metrics no tool provides, grouped by concept: id -> (labels, shown name).
+# Grouping lets a disclaimer on any label (e.g. "non-performing loan") cover
+# every spelling ("NPL", "NPL ratio") and report the concept once.
+_PHANTOM_CONCEPTS = {
+    "lcr": (["liquidity coverage ratio", "lcr"], "LCR"),
+    "nsfr": (["net stable funding ratio", "nsfr"], "NSFR"),
+    "npl": (["npl ratio", "non-performing loan", "non performing loan", "npl"],
+            "NPL"),
 }
 
 
-def _phantom_hits(low: str) -> list[str]:
-    """Shown names of phantom metrics present in a lowercased sentence.
-    Longer labels win so 'npl ratio' isn't also reported as bare 'npl'."""
-    names: list[str] = []
-    matched_spans: list[tuple[int, int]] = []
-    for label in sorted(_PHANTOMS, key=len, reverse=True):
-        for m in re.finditer(rf"\b{re.escape(label)}\b", low):
-            span = (m.start(), m.end())
-            if any(s <= span[0] < e for s, e in matched_spans):
-                continue
-            matched_spans.append(span)
-            names.append(_PHANTOMS[label])
-    return names
+def _concept_present(low: str, labels: list[str]) -> bool:
+    return any(re.search(rf"\b{re.escape(lab)}\b", low) for lab in labels)
 
 
 def unsupported_claims(answer: str, trace: list[dict]) -> list[str]:
+    """Membership guards (phantom metrics, fabricated periods) are scoped to the
+    WHOLE answer, not one sentence: an honest decline discloses inability in one
+    sentence and discusses the concept in others, so a sentence-local guard
+    would flag the explanatory mentions. See the design's false-positive note."""
     grounded = grounded_periods(trace)
+    sents = [(s, s.lower(), bool(_DISCLAIMER.search(s)),
+              bool(_UNAVAIL.search(s)), bool(_OFFER.search(s)))
+             for s in _sentences(answer)]
+
+    # A phantom concept disclosed as un-seeable anywhere is declined everywhere.
+    disclaimed: set[str] = set()
+    for _s, low, disc, _u, _o in sents:
+        if disc:
+            for cid, (labels, _name) in _PHANTOM_CONCEPTS.items():
+                if _concept_present(low, labels):
+                    disclaimed.add(cid)
+    # A non-grounded period the answer anywhere calls unavailable / offers to
+    # close is acknowledged, not fabricated.
+    acked: set[str] = set()
+    for s, _low, disc, unavail, offer in sents:
+        if disc or unavail or offer:
+            acked.update(_PERIOD.findall(s))
+
     issues: list[str] = []
-    for s in _sentences(answer):
-        low = s.lower()
-        disclaimed = bool(_DISCLAIMER.search(s))
-        unavail = bool(_UNAVAIL.search(s))
-        offer = bool(_OFFER.search(s))
-        # (a) phantom-metric membership
-        if not disclaimed:
-            for name in _phantom_hits(low):
-                issues.append(f"{name} — no tool provides this")
-        # (b) + (c) periods
-        for p in _PERIOD.findall(s):
-            if p in grounded:
-                if unavail:
-                    issues.append(
-                        f"{p} described as unavailable, but a tool returned it")
-            elif not (disclaimed or unavail or offer):
+    # (a) phantom-metric membership — once per concept, answer-level
+    low_all = answer.lower()
+    for cid, (labels, name) in _PHANTOM_CONCEPTS.items():
+        if cid not in disclaimed and _concept_present(low_all, labels):
+            issues.append(f"{name} — no tool provides this")
+    # (b) + (c) periods
+    for s, _low, _disc, unavail, _offer in sents:
+        periods = _PERIOD.findall(s)
+        # (b) a grounded period called unavailable — only when every period in
+        # the sentence is grounded, so the cue can't be about a different,
+        # genuinely-unavailable period sharing the sentence.
+        if unavail and periods and all(p in grounded for p in periods):
+            for p in periods:
+                issues.append(
+                    f"{p} described as unavailable, but a tool returned it")
+        # (c) a non-grounded period asserted as real, not acknowledged anywhere
+        for p in periods:
+            if p not in grounded and p not in acked:
                 issues.append(f"{p} — no tool has data for this period")
     # de-duplicate, preserve order
     seen: set[str] = set()

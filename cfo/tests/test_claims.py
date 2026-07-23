@@ -36,7 +36,7 @@ def test_cue_regexes_match_expected_phrases():
 
 
 def test_phantoms_cover_lcr_nsfr_npl():
-    keys = set(claims._PHANTOMS)
+    keys = set(claims._PHANTOM_CONCEPTS)
     assert "lcr" in keys and "npl" in keys and "nsfr" in keys
 
 
@@ -80,3 +80,28 @@ def test_issues_are_deduplicated():
     trace = _trace_periods("2026-07")
     ans = "Our LCR is weak. Again, the LCR is weak."
     assert claims.unsupported_claims(ans, trace) == ["LCR — no tool provides this"]
+
+
+def test_phantom_disclaimed_anywhere_is_not_flagged_in_other_sentences():
+    """The live failure: an honest NPL decline discloses inability in one
+    sentence and explains the concept in others; those explanatory mentions
+    must not be flagged. Disclaimer scope is the whole answer, per concept."""
+    trace = _trace_periods("2026-07")
+    ans = ("I have no tool that reports a non-performing loan (NPL) ratio. "
+           "NPL is a count of loans past a delinquency threshold. "
+           "These are not substitutes for an NPL ratio.")
+    assert claims.unsupported_claims(ans, trace) == []
+
+
+def test_phantom_grouped_so_npl_reported_once_not_as_two_labels():
+    trace = _trace_periods("2026-07")
+    ans = "Our NPL is high and the NPL ratio is climbing."
+    assert claims.unsupported_claims(ans, trace) == ["NPL — no tool provides this"]
+
+
+def test_fabricated_period_acknowledged_in_another_sentence_is_not_flagged():
+    """Same root cause on the period side: a non-grounded period the answer
+    calls unavailable anywhere is not a fabrication."""
+    trace = _trace_periods("2026-07")
+    ans = "In 2026-05 our NIM was 5%. But 2026-05 is not closed."
+    assert claims.unsupported_claims(ans, trace) == []
