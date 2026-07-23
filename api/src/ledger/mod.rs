@@ -22,6 +22,20 @@ pub enum Account {
     Payable,
     Revenue,
     Expense,
+    // Bank-economics chart (spec: GL chart-of-accounts expansion). Additive only.
+    CashReserves,
+    CardReceivable,
+    OverdraftReceivable,
+    LoansReceivable,
+    TreasuryPlacement,
+    CustomerDeposits,
+    Capital,
+    RetainedEarnings,
+    InterestIncome,
+    InterchangeIncome,
+    FeeIncome,
+    InterestExpense,
+    OperatingExpense,
 }
 
 impl Account {
@@ -33,6 +47,19 @@ impl Account {
             Account::Payable => "AP",
             Account::Revenue => "REVENUE",
             Account::Expense => "EXPENSE",
+            Account::CashReserves => "CASH_RESERVES",
+            Account::CardReceivable => "CARD_AR",
+            Account::OverdraftReceivable => "OVERDRAFT_AR",
+            Account::LoansReceivable => "LOANS_AR",
+            Account::TreasuryPlacement => "TREASURY",
+            Account::CustomerDeposits => "DEPOSITS",
+            Account::Capital => "CAPITAL",
+            Account::RetainedEarnings => "RETAINED",
+            Account::InterestIncome => "INT_INCOME",
+            Account::InterchangeIncome => "INTERCHANGE",
+            Account::FeeIncome => "FEE_INCOME",
+            Account::InterestExpense => "INT_EXPENSE",
+            Account::OperatingExpense => "OPEX",
         }
     }
 
@@ -44,6 +71,19 @@ impl Account {
             Account::Payable => "0000160000",
             Account::Revenue => "0000800000",
             Account::Expense => "0000400000",
+            Account::CashReserves => "0000105000",
+            Account::CardReceivable => "0000141000",
+            Account::OverdraftReceivable => "0000141500",
+            Account::LoansReceivable => "0000142000",
+            Account::TreasuryPlacement => "0000150000",
+            Account::CustomerDeposits => "0000210000",
+            Account::Capital => "0000300000",
+            Account::RetainedEarnings => "0000330000",
+            Account::InterestIncome => "0000800100",
+            Account::InterchangeIncome => "0000800200",
+            Account::FeeIncome => "0000800300",
+            Account::InterestExpense => "0000400100",
+            Account::OperatingExpense => "0000400200",
         }
     }
 }
@@ -119,4 +159,58 @@ pub trait Ledger: Send + Sync {
 
     /// Trial-balance style totals per account, in company-code currency.
     async fn balances(&self) -> Result<Vec<AccountBalance>, LedgerError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Account;
+
+    /// Every new role maps to the agreed modern code and legacy saknr.
+    /// Existing roles are asserted too, to catch accidental edits.
+    #[test]
+    fn account_mappings_are_stable() {
+        let cases = [
+            // (role, modern_code, legacy_account)
+            (Account::Bank, "BANK", "0000113100"),
+            (Account::Receivable, "AR", "0000140000"),
+            (Account::Payable, "AP", "0000160000"),
+            (Account::Revenue, "REVENUE", "0000800000"),
+            (Account::Expense, "EXPENSE", "0000400000"),
+            (Account::CashReserves, "CASH_RESERVES", "0000105000"),
+            (Account::CardReceivable, "CARD_AR", "0000141000"),
+            (Account::OverdraftReceivable, "OVERDRAFT_AR", "0000141500"),
+            (Account::LoansReceivable, "LOANS_AR", "0000142000"),
+            (Account::TreasuryPlacement, "TREASURY", "0000150000"),
+            (Account::CustomerDeposits, "DEPOSITS", "0000210000"),
+            (Account::Capital, "CAPITAL", "0000300000"),
+            (Account::RetainedEarnings, "RETAINED", "0000330000"),
+            (Account::InterestIncome, "INT_INCOME", "0000800100"),
+            (Account::InterchangeIncome, "INTERCHANGE", "0000800200"),
+            (Account::FeeIncome, "FEE_INCOME", "0000800300"),
+            (Account::InterestExpense, "INT_EXPENSE", "0000400100"),
+            (Account::OperatingExpense, "OPEX", "0000400200"),
+        ];
+        for (role, modern, legacy) in cases {
+            assert_eq!(role.modern_code(), modern, "modern_code for {role:?}");
+            assert_eq!(role.legacy_account(), legacy, "legacy_account for {role:?}");
+        }
+    }
+
+    /// The JSON wire name for each new role is its snake_case identifier,
+    /// which is what `/ledger/journal` accepts.
+    #[test]
+    fn new_roles_deserialize_from_snake_case() {
+        let json = r#"["cash_reserves","customer_deposits","interest_income","interest_expense","retained_earnings"]"#;
+        let roles: Vec<Account> = serde_json::from_str(json).expect("valid roles");
+        assert_eq!(
+            roles,
+            vec![
+                Account::CashReserves,
+                Account::CustomerDeposits,
+                Account::InterestIncome,
+                Account::InterestExpense,
+                Account::RetainedEarnings,
+            ]
+        );
+    }
 }
