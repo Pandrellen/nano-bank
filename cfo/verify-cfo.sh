@@ -35,6 +35,16 @@ echo "$PUSHBACK" | grep -Eiq \
   "can(no|'?)t see|do(es)? not (have|show|track)|no .*(npl|non-performing)|not available|cannot verify" \
   || { echo "FAIL: CFO accepted a premise its tools cannot verify"; exit 1; }
 
+# The honest NPL decline must not itself be flagged as an unsupported claim
+# (disclaimer guard), verified end to end.
+echo "== NPL decline is not flagged as an unsupported claim =="
+CLAIMS=$(curl -fsS -XPOST "$CFO/ask" -H 'content-type: application/json' \
+  -d '{"message":"Our 3% NPL ratio worries me — what is driving it?"}' \
+  | python -c 'import sys,json; print(json.load(sys.stdin)["verification"]["unsupported_claims"])')
+echo "unsupported_claims: $CLAIMS"
+[ "$CLAIMS" = "[]" ] \
+  || { echo "FAIL: honest NPL decline was flagged as an unsupported claim"; exit 1; }
+
 # The response must carry a verification block, and the health question's
 # figures should all be tool-grounded (empty ungrounded list).
 echo "== verification block present and clean =="

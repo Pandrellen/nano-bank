@@ -16,6 +16,7 @@ from . import model_factory as mf
 from .tools import get_tools
 from .trace import TraceRecorder
 from . import verifier
+from . import claims
 
 CFO_PROMPT = (
     "You are the Chief Financial Officer of nano-bank, a Canadian challenger "
@@ -87,9 +88,11 @@ async def ask(settings: Settings, message: str,
     # ask the agent (same thread, so it keeps context and can call more tools)
     # to ground it or own it as an estimate. Exactly one retry.
     revised = False
-    if verifier.ungrounded(answer, rec.events()):
+    figs = verifier.ungrounded(answer, rec.events())
+    clms = claims.unsupported_claims(answer, rec.events())
+    if figs or clms:
         revised = True
-        nudge = verifier.revise_prompt(verifier.ungrounded(answer, rec.events()))
+        nudge = verifier.revise_prompt(figs, clms)
         out = await agent.ainvoke({"messages": [HumanMessage(nudge)]},
                                   config=cfg)
         answer = _last_ai_text(out)

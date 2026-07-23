@@ -152,3 +152,42 @@ def test_prompt_distinguishes_direct_from_converted_values():
     assert "verbatim" in p
     assert "convert" in p        # matches "converted"/"conversion"
     assert "ratio" in p and "percent" in p
+
+
+class _BadPeriodThenClean:
+    """Pass 1 makes a false period-availability claim (no bad number); pass 2
+    is clean. Exercises revision driven by the claim channel alone."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, state, config=None):
+        self.calls += 1
+        if self.calls == 1:
+            text = "NIM for 2026-07 is fine, but 2026-07 may need to be closed first."
+        else:
+            text = "NIM for 2026-07 is fine; the period is closed and available."
+        return {"messages": state["messages"] + [AIMessage(text)]}
+
+
+def test_ask_revises_on_a_claim_with_no_bad_number():
+    s = Settings.from_env({"OLLAMA_API_KEY": "x"})
+    fake = _BadPeriodThenClean()
+
+    async def _fake_get_tools(settings):
+        return []
+
+    # 2026-07 is grounded (list_periods returned it), so calling it
+    # "may need to be closed" is a false claim.
+    trace = [{"kind": "tool", "name": "list_periods", "input": "{}",
+              "output": "['2026-06', '2026-07']"}]
+
+    with patch.object(cfo_agent, "get_tools", _fake_get_tools), \
+         patch.object(cfo_agent, "create_react_agent", return_value=fake), \
+         patch.object(cfo_agent.mf, "llm", return_value=object()), \
+         patch.object(cfo_agent.TraceRecorder, "events", lambda self: trace):
+        out = asyncio.run(cfo_agent.ask(s, "How's July?", thread_id="t"))
+
+    assert fake.calls == 2                                # revised once
+    assert out["verification"]["revised"] is True
+    assert out["verification"]["unsupported_claims"] == []   # clean after
