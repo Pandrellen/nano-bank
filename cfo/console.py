@@ -4,6 +4,8 @@ import os
 import httpx
 import streamlit as st
 
+from cfo.verifier import badge
+
 API = os.environ.get("CFO_API_URL", "http://localhost:8089")
 
 st.set_page_config(page_title="nano-bank CFO", page_icon="📊")
@@ -23,6 +25,7 @@ if prompt := st.chat_input("Ask the CFO about the bank's finances…"):
     with st.chat_message("user"):
         st.markdown(prompt)
     with st.chat_message("assistant"):
+        veri = None
         try:
             r = httpx.post(f"{API}/ask",
                            json={"message": prompt,
@@ -32,7 +35,14 @@ if prompt := st.chat_input("Ask the CFO about the bank's finances…"):
             data = r.json()
             st.session_state.thread_id = data.get("thread_id")
             answer = data.get("answer", "(no answer)")
+            veri = data.get("verification")
         except Exception as e:  # noqa: BLE001
             answer = f"⚠️ CFO unreachable: {e}"
         st.markdown(answer)
+        if veri is not None:
+            line = badge(veri)
+            if veri.get("ungrounded"):
+                st.warning(line)
+            else:
+                st.caption(line)
         st.session_state.history.append(("assistant", answer))
