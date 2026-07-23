@@ -52,3 +52,32 @@ def test_claimed_figures_handles_unicode_minus():
     assert len(figs) == 1
     assert figs[0].is_percent
     assert figs[0].value == D("-3.70")
+
+
+def _trace(*outputs):
+    return [{"kind": "tool", "name": "t", "output": o} for o in outputs]
+
+
+def test_ungrounded_flags_a_fabricated_figure():
+    """The $7,652 'monthly loss' the CFO invented appears in no tool output."""
+    trace = _trace("{'net_income': '1448.08', 'roe': '0.2131'}")
+    ans = "Net income was $1,448.08, but after the loss it is -$7,652.00."
+    assert verifier.ungrounded(ans, trace) == ["-$7,652.00"]
+
+
+def test_percent_matches_ratio_form_within_rounding():
+    """Tools store ratios (0.213108); prose states 21.31% or 21.3%."""
+    trace = _trace("{'roe': '0.213108'}")
+    assert verifier.ungrounded("ROE is 21.31%.", trace) == []
+    assert verifier.ungrounded("ROE is 21.3%.", trace) == []
+
+
+def test_currency_matches_after_separator_strip():
+    trace = _trace("{'total_assets': '815636.08'}")
+    assert verifier.ungrounded("Total assets $815,636.08.", trace) == []
+
+
+def test_grounded_and_ungrounded_together():
+    trace = _trace("{'roe': '0.2131', 'net_income': '1448.08'}")
+    ans = "ROE 21.31% on $1,448.08, and an invented 42.0% efficiency."
+    assert verifier.ungrounded(ans, trace) == ["42.0%"]
