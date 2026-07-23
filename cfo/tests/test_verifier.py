@@ -106,3 +106,29 @@ def test_badge_reflects_state():
     warn = verifier.badge({"grounded": [], "ungrounded": ["$7,652.00"],
                            "revised": True})
     assert "⚠" in warn and "$7,652.00" in warn
+
+
+def test_report_includes_unsupported_claims():
+    trace = [{"kind": "tool", "name": "list_periods", "input": "{}",
+              "output": "['2026-07']"}]
+    rep = verifier.report("Our LCR is weak.", trace, revised=False)
+    assert rep["unsupported_claims"] == ["LCR — no tool provides this"]
+    assert rep["ungrounded"] == []
+
+
+def test_revise_prompt_includes_claims_when_present():
+    msg = verifier.revise_prompt(["$7,652.00"], ["LCR — no tool provides this"])
+    assert "$7,652.00" in msg
+    assert "LCR — no tool provides this" in msg
+
+
+def test_revise_prompt_without_claims_is_unchanged():
+    msg = verifier.revise_prompt(["$7,652.00"])
+    assert "$7,652.00" in msg
+
+
+def test_badge_warns_when_only_a_claim_is_present():
+    warn = verifier.badge({"grounded": [], "ungrounded": [],
+                           "unsupported_claims": ["LCR — no tool provides this"],
+                           "revised": True})
+    assert "⚠" in warn and "LCR" in warn

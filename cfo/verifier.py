@@ -8,6 +8,8 @@ from __future__ import annotations
 import re
 from decimal import Decimal, InvalidOperation
 
+from . import claims as _claims
+
 # A signed number literal: comma-grouped (1,448.08) or plain (9100.00 / 510000),
 # with an optional decimal part. Unicode minus is normalised before matching.
 _NUM = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
@@ -117,22 +119,32 @@ def report(answer: str, trace: list[dict], *, revised: bool) -> dict:
     u: list[str] = []
     for f in claimed_figures(answer):
         (g if _is_grounded(f, grounded) else u).append(f.text)
-    return {"grounded": g, "ungrounded": u, "revised": revised}
+    return {"grounded": g, "ungrounded": u,
+            "unsupported_claims": _claims.unsupported_claims(answer, trace),
+            "revised": revised}
 
 
-def revise_prompt(figures: list[str]) -> str:
-    joined = ", ".join(figures)
-    return (
-        "Verification found figures in your answer that are not grounded in "
-        f"any tool result from this turn: {joined}. For each one, either "
-        "recompute it by calling the appropriate tool, or state plainly that "
-        "it is your own estimate rather than a tool figure. Then give the "
-        "corrected answer.")
+def revise_prompt(figures: list[str], claims: list[str] = ()) -> str:
+    parts = []
+    if figures:
+        parts.append(
+            "Verification found figures in your answer that are not grounded "
+            f"in any tool result from this turn: {', '.join(figures)}. For each "
+            "one, either recompute it by calling the appropriate tool, or state "
+            "plainly that it is your own estimate rather than a tool figure.")
+    if claims:
+        parts.append(
+            "You also made claims not supported by your tools this turn: "
+            f"{', '.join(claims)}. Correct each — call the tool that settles "
+            "it, or state plainly you cannot see it — and never assert a period "
+            "is unavailable if a tool returned data for it.")
+    parts.append("Then give the corrected answer.")
+    return " ".join(parts)
 
 
 def badge(rep: dict) -> str:
-    if not rep["ungrounded"]:
+    issues = list(rep["ungrounded"]) + list(rep.get("unsupported_claims", []))
+    if not issues:
         return "✓ all figures tool-grounded"
-    figs = ", ".join(rep["ungrounded"])
     tail = " (after one revision)" if rep["revised"] else ""
-    return f"⚠ {len(rep['ungrounded'])} figure(s) ungrounded{tail}: {figs}"
+    return f"⚠ {len(issues)} issue(s){tail}: {', '.join(issues)}"
