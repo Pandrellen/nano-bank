@@ -87,11 +87,14 @@ export async function signUpAction(formData: FormData): Promise<SignUpResult> {
   }
 
   if (!response.ok) {
-    const errorBody: ApiErrorBody = await response.json();
-    return {
-      success: false,
-      message: errorBody.error.message || "Unable to create account.",
-    };
+    let message = "Unable to create account.";
+    try {
+      const errorBody: ApiErrorBody = await response.json();
+      message = errorBody.error.message || message;
+    } catch (error) {
+      console.error("Failed to parse sign-up error response:", error);
+    }
+    return { success: false, message };
   }
 
   return {
@@ -133,11 +136,14 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
   }
 
   if (!response.ok) {
-    const errorBody: ApiErrorBody = await response.json();
-    return {
-      success: false,
-      message: errorBody.error.message || "Invalid email or password.",
-    };
+    let message = "Invalid email or password.";
+    try {
+      const errorBody: ApiErrorBody = await response.json();
+      message = errorBody.error.message || message;
+    } catch (error) {
+      console.error("Failed to parse sign-in error response:", error);
+    }
+    return { success: false, message };
   }
 
   const data: LoginResponseBody = await response.json();
