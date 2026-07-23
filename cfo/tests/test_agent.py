@@ -75,3 +75,70 @@ def test_prompt_is_honest_about_close_period():
     p = cfo_agent.CFO_PROMPT.lower()
     assert "close_period" in p
     assert "no financial actions" in p
+
+
+class _TwoPassAgent:
+    """Pass 1 returns an ungrounded figure; pass 2 (after the revise message)
+    returns a clean, grounded answer. Records how many times it was invoked."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def ainvoke(self, state, config=None):
+        self.calls += 1
+        if self.calls == 1:
+            text = "Net income $1,448.08, and an invented loss of -$7,652.00."
+        else:
+            text = "Corrected: net income $1,448.08 (my estimate: none)."
+        return {"messages": state["messages"] + [AIMessage(text)]}
+
+
+def test_ask_revises_once_when_a_figure_is_ungrounded():
+    s = Settings.from_env({"OLLAMA_API_KEY": "x"})
+    fake = _TwoPassAgent()
+
+    async def _fake_get_tools(settings):
+        return []
+
+    # The grounded set comes from the trace; stub it so 1448.08 is grounded and
+    # 7652 is not, regardless of what the fake agent "called".
+    trace = [{"kind": "tool", "name": "income_statement",
+              "output": "{'net_income': '1448.08'}"}]
+
+    with patch.object(cfo_agent, "get_tools", _fake_get_tools), \
+         patch.object(cfo_agent, "create_react_agent", return_value=fake), \
+         patch.object(cfo_agent.mf, "llm", return_value=object()), \
+         patch.object(cfo_agent.TraceRecorder, "events", lambda self: trace):
+        out = asyncio.run(cfo_agent.ask(s, "How did we do?", thread_id="t"))
+
+    assert fake.calls == 2                       # revised exactly once
+    assert out["verification"]["revised"] is True
+    assert "$1,448.08" in out["answer"]
+
+
+def test_ask_does_not_revise_when_all_grounded():
+    s = Settings.from_env({"OLLAMA_API_KEY": "x"})
+    fake = _TwoPassAgent()
+
+    async def _fake_get_tools(settings):
+        return []
+
+    trace = [{"kind": "tool", "name": "income_statement",
+              "output": "{'net_income': '1448.08'}"}]
+
+    # Pass-1 answer here contains only grounded figures.
+    async def _one_pass(state, config=None):
+        fake.calls += 1
+        return {"messages": state["messages"] +
+                [AIMessage("Net income was $1,448.08.")]}
+    fake.ainvoke = _one_pass
+
+    with patch.object(cfo_agent, "get_tools", _fake_get_tools), \
+         patch.object(cfo_agent, "create_react_agent", return_value=fake), \
+         patch.object(cfo_agent.mf, "llm", return_value=object()), \
+         patch.object(cfo_agent.TraceRecorder, "events", lambda self: trace):
+        out = asyncio.run(cfo_agent.ask(s, "How did we do?", thread_id="t"))
+
+    assert fake.calls == 1                       # no revision
+    assert out["verification"]["revised"] is False
+    assert out["verification"]["ungrounded"] == []

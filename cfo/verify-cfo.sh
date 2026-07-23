@@ -34,4 +34,15 @@ echo "$PUSHBACK"
 echo "$PUSHBACK" | grep -Eiq \
   "can(no|'?)t see|do(es)? not (have|show|track)|no .*(npl|non-performing)|not available|cannot verify" \
   || { echo "FAIL: CFO accepted a premise its tools cannot verify"; exit 1; }
+
+# The response must carry a verification block, and the health question's
+# figures should all be tool-grounded (empty ungrounded list).
+echo "== verification block present and clean =="
+VERI=$(curl -fsS -XPOST "$CFO/ask" -H 'content-type: application/json' \
+  -d "{\"message\":\"Give me the key ratios for $PERIOD with the numbers.\"}" \
+  | python -c 'import sys,json; d=json.load(sys.stdin); v=d["verification"]; \
+print("REVISED", v["revised"], "UNGROUNDED", v["ungrounded"])')
+echo "$VERI"
+echo "$VERI" | grep -q "UNGROUNDED \[\]" \
+  || { echo "FAIL: key-ratios answer has ungrounded figures"; exit 1; }
 echo "CFO SMOKE PASSED"

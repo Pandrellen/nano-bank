@@ -15,6 +15,7 @@ from .config import Settings
 from . import model_factory as mf
 from .tools import get_tools
 from .trace import TraceRecorder
+from . import verifier
 
 CFO_PROMPT = (
     "You are the Chief Financial Officer of nano-bank, a Canadian challenger "
@@ -65,13 +66,29 @@ async def ask(settings: Settings, message: str,
     rec = TraceRecorder()
     agent = create_react_agent(mf.llm(), tools, prompt=CFO_PROMPT,
                                checkpointer=InMemorySaver())
-    out = await agent.ainvoke(
-        {"messages": [HumanMessage(message)]},
-        config={"configurable": {"thread_id": thread_id}, "recursion_limit": 40,
-                "callbacks": [rec]})
-    answer = "(no answer)"
-    for m in reversed(out["messages"]):
-        if isinstance(m, AIMessage) and (m.content or "").strip():
-            answer = m.content
-            break
-    return {"answer": answer, "thread_id": thread_id, "trace": rec.events()}
+    cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 40,
+           "callbacks": [rec]}
+
+    def _last_ai_text(state) -> str:
+        for m in reversed(state["messages"]):
+            if isinstance(m, AIMessage) and (m.content or "").strip():
+                return m.content
+        return "(no answer)"
+
+    out = await agent.ainvoke({"messages": [HumanMessage(message)]}, config=cfg)
+    answer = _last_ai_text(out)
+
+    # One revise pass: if a figure isn't grounded in a tool result this turn,
+    # ask the agent (same thread, so it keeps context and can call more tools)
+    # to ground it or own it as an estimate. Exactly one retry.
+    revised = False
+    if verifier.ungrounded(answer, rec.events()):
+        revised = True
+        nudge = verifier.revise_prompt(verifier.ungrounded(answer, rec.events()))
+        out = await agent.ainvoke({"messages": [HumanMessage(nudge)]},
+                                  config=cfg)
+        answer = _last_ai_text(out)
+
+    return {"answer": answer, "thread_id": thread_id, "trace": rec.events(),
+            "verification": verifier.report(answer, rec.events(),
+                                            revised=revised)}
