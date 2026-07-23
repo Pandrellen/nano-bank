@@ -25,7 +25,11 @@ class TraceRecorder(BaseCallbackHandler):
                            "t0": time.perf_counter(), "input": _short(input_str)}
 
     def on_tool_end(self, output, **kwargs):
-        self._close(kwargs.get("run_id"), ok=True, output=_short(output))
+        # Full output, not _short: the verifier parses these numbers to build
+        # its grounded set, and a truncated bundle would drop figures and
+        # produce false "ungrounded" flags. Tool outputs are bounded (a few KB).
+        text = output if isinstance(output, str) else str(output)
+        self._close(kwargs.get("run_id"), ok=True, output=text)
 
     def on_tool_error(self, error, **kwargs):
         self._close(kwargs.get("run_id"), ok=False, error=_short(error))
