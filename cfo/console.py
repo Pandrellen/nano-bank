@@ -1,10 +1,14 @@
 """Streamlit chat console for the Agent CFO. Talks to the CFO /ask endpoint."""
 from __future__ import annotations
 import os
+import sys
 import httpx
 import streamlit as st
 
-from cfo.verifier import badge
+# `streamlit run cfo/console.py` puts cfo/ (the script dir) on sys.path, not the
+# repo root, so the `cfo` package isn't importable by default. Add the repo root.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from cfo.verifier import badge  # noqa: E402
 
 API = os.environ.get("CFO_API_URL", "http://localhost:8089")
 
