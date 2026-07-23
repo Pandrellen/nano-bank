@@ -109,3 +109,30 @@ def ungrounded(answer: str, trace: list[dict]) -> list[str]:
     grounded = grounded_values(trace)
     return [f.text for f in claimed_figures(answer)
             if not _is_grounded(f, grounded)]
+
+
+def report(answer: str, trace: list[dict], *, revised: bool) -> dict:
+    grounded = grounded_values(trace)
+    g: list[str] = []
+    u: list[str] = []
+    for f in claimed_figures(answer):
+        (g if _is_grounded(f, grounded) else u).append(f.text)
+    return {"grounded": g, "ungrounded": u, "revised": revised}
+
+
+def revise_prompt(figures: list[str]) -> str:
+    joined = ", ".join(figures)
+    return (
+        "Verification found figures in your answer that are not grounded in "
+        f"any tool result from this turn: {joined}. For each one, either "
+        "recompute it by calling the appropriate tool, or state plainly that "
+        "it is your own estimate rather than a tool figure. Then give the "
+        "corrected answer.")
+
+
+def badge(rep: dict) -> str:
+    if not rep["ungrounded"]:
+        return "✓ all figures tool-grounded"
+    figs = ", ".join(rep["ungrounded"])
+    tail = " (after one revision)" if rep["revised"] else ""
+    return f"⚠ {len(rep['ungrounded'])} figure(s) ungrounded{tail}: {figs}"

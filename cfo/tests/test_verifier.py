@@ -81,3 +81,28 @@ def test_grounded_and_ungrounded_together():
     trace = _trace("{'roe': '0.2131', 'net_income': '1448.08'}")
     ans = "ROE 21.31% on $1,448.08, and an invented 42.0% efficiency."
     assert verifier.ungrounded(ans, trace) == ["42.0%"]
+
+
+def test_report_splits_grounded_and_ungrounded():
+    trace = _trace("{'roe': '0.2131'}")
+    rep = verifier.report("ROE 21.31% vs made-up $9,999.00.", trace,
+                          revised=False)
+    assert rep["grounded"] == ["21.31%"]
+    assert rep["ungrounded"] == ["$9,999.00"]
+    assert rep["revised"] is False
+
+
+def test_revise_prompt_names_every_offending_figure():
+    msg = verifier.revise_prompt(["$7,652.00", "42.0%"])
+    assert "$7,652.00" in msg and "42.0%" in msg
+    assert "tool" in msg.lower()
+    assert "estimate" in msg.lower()
+
+
+def test_badge_reflects_state():
+    clean = verifier.badge({"grounded": ["21.31%"], "ungrounded": [],
+                            "revised": False})
+    assert "✓" in clean  # check mark
+    warn = verifier.badge({"grounded": [], "ungrounded": ["$7,652.00"],
+                           "revised": True})
+    assert "⚠" in warn and "$7,652.00" in warn
