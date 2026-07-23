@@ -67,3 +67,48 @@ _PHANTOMS = {
     "non performing loan": "non-performing loan",
     "npl": "NPL",
 }
+
+
+def _phantom_hits(low: str) -> list[str]:
+    """Shown names of phantom metrics present in a lowercased sentence.
+    Longer labels win so 'npl ratio' isn't also reported as bare 'npl'."""
+    names: list[str] = []
+    matched_spans: list[tuple[int, int]] = []
+    for label in sorted(_PHANTOMS, key=len, reverse=True):
+        for m in re.finditer(rf"\b{re.escape(label)}\b", low):
+            span = (m.start(), m.end())
+            if any(s <= span[0] < e for s, e in matched_spans):
+                continue
+            matched_spans.append(span)
+            names.append(_PHANTOMS[label])
+    return names
+
+
+def unsupported_claims(answer: str, trace: list[dict]) -> list[str]:
+    grounded = grounded_periods(trace)
+    issues: list[str] = []
+    for s in _sentences(answer):
+        low = s.lower()
+        disclaimed = bool(_DISCLAIMER.search(s))
+        unavail = bool(_UNAVAIL.search(s))
+        offer = bool(_OFFER.search(s))
+        # (a) phantom-metric membership
+        if not disclaimed:
+            for name in _phantom_hits(low):
+                issues.append(f"{name} — no tool provides this")
+        # (b) + (c) periods
+        for p in _PERIOD.findall(s):
+            if p in grounded:
+                if unavail:
+                    issues.append(
+                        f"{p} described as unavailable, but a tool returned it")
+            elif not (disclaimed or unavail or offer):
+                issues.append(f"{p} — no tool has data for this period")
+    # de-duplicate, preserve order
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for i in issues:
+        if i not in seen:
+            seen.add(i)
+            deduped.append(i)
+    return deduped

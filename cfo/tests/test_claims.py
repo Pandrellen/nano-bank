@@ -38,3 +38,45 @@ def test_cue_regexes_match_expected_phrases():
 def test_phantoms_cover_lcr_nsfr_npl():
     keys = set(claims._PHANTOMS)
     assert "lcr" in keys and "npl" in keys and "nsfr" in keys
+
+
+def _trace_periods(*periods):
+    inp = "".join(f"{{'period': '{p}'}}" for p in periods)
+    return [{"kind": "tool", "name": "list_periods", "input": "{}",
+             "output": str(list(periods))},
+            {"kind": "tool", "name": "nim", "input": inp, "output": "{}"}]
+
+
+def test_phantom_metric_affirmative_is_flagged_but_disclaimer_is_not():
+    trace = _trace_periods("2026-07")
+    assert claims.unsupported_claims("Our LCR looks weak.", trace) == \
+        ["LCR — no tool provides this"]
+    assert claims.unsupported_claims("I cannot see an LCR.", trace) == []
+    assert claims.unsupported_claims(
+        "My tools don't produce an NPL ratio.", trace) == []
+
+
+def test_grounded_period_called_unavailable_is_flagged():
+    trace = _trace_periods("2026-06", "2026-07")
+    ans = "The nim tool returned 2026-07, but that period may need to be closed first."
+    assert claims.unsupported_claims(ans, trace) == \
+        ["2026-07 described as unavailable, but a tool returned it"]
+
+
+def test_grounded_period_stated_plainly_is_not_flagged():
+    trace = _trace_periods("2026-07")
+    assert claims.unsupported_claims("NIM for 2026-07 is 6.28%.", trace) == []
+
+
+def test_fabricated_period_is_flagged_but_offer_and_unavail_are_not():
+    trace = _trace_periods("2026-07")
+    assert claims.unsupported_claims("In 2026-05 our NIM was 5%.", trace) == \
+        ["2026-05 — no tool has data for this period"]
+    assert claims.unsupported_claims("I can close 2026-08 for you.", trace) == []
+    assert claims.unsupported_claims("2026-08 is not closed yet.", trace) == []
+
+
+def test_issues_are_deduplicated():
+    trace = _trace_periods("2026-07")
+    ans = "Our LCR is weak. Again, the LCR is weak."
+    assert claims.unsupported_claims(ans, trace) == ["LCR — no tool provides this"]
