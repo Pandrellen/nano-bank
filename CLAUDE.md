@@ -193,7 +193,7 @@ other core (a new entry id / `belnr`).
 (`available = overdraft_limit − balance − holds`).
 
 On top of that, `capture` and `settle` post the **aggregate GL effect** to the
-core via the port (capture: debit Receivable / credit Payable; settle: debit
+core via the port (capture: debit CardReceivable / credit Payable; settle: debit
 Payable / credit Bank), recording the core's document id in
 `transactions.metadata.gl_entry`. The GL post happens inside the capture/settle
 DB transaction, before commit — so if the core can't record it, the operation
@@ -204,8 +204,9 @@ local-only (a hold; no money moves).
 Deposit and withdrawal move value across an internal **`EXTERNAL_CASH`** account
 (a chequing account under a synthetic `cash@nano.bank` customer, $1T overdraft)
 and post the aggregate effect through the port (deposit: debit `Bank` / credit
-`Payable`; withdrawal the reverse). A **transfer is local-only** — both customer
-accounts map to the same `Payable` GL role, so the net GL effect is zero. All
+`CustomerDeposits`; withdrawal the reverse). A **transfer is local-only** — both
+customer accounts map to the same `CustomerDeposits` GL role, so the net GL effect
+is zero. All
 three enforce balance/status/type checks and the `account_limits` counters, and
 update `daily_transaction_summaries`; transfer honors an `idempotency_key`.
 
@@ -332,6 +333,43 @@ time, with settlement finality**. Design spec:
 - **available_balance:** recomputed on **customer** accounts around rail posts;
   the Lynx system accounts stay at 0 (float on the $1T overdraft) — same rule as
   Interac/AFT.
+
+## Interest / NIM engine
+
+The finance engine (`handlers/finance.rs`, `finance/`) turns balances × rates
+into GL postings over time (spec #2; design/plan in `docs/specs/` + `docs/plans/`).
+Two **service-authenticated** batch endpoints, meant to be cron-driven, plus two
+inline recognitions:
+
+- **`POST /api/v1/finance/accrue` `{"as_of":"YYYY-MM-DD"}`** — one day's ACT/365
+  interest on all eligible deposit (expense) and credit-card (income) balances;
+  writes per-account rows to the `interest_accruals` subledger and posts the
+  aggregate GL (`InterestExpense`/`AccruedInterestPayable`,
+  `AccruedInterestReceivable`/`InterestIncome`). **Idempotent per date**
+  (`accrual_runs`).
+- **`POST /api/v1/finance/capitalise` `{"period":"YYYY-MM"}`** — reclasses the
+  month's uncapitalised accruals into customer balances (deposit interest
+  credited, card interest owed) and charges the **monthly maintenance fee**
+  (default $4, waived ≥ $3000). **Idempotent per period** (`capitalisation_runs`).
+- **Interchange** is recognized inline at card `capture` (Dr `CashReserves` / Cr
+  `InterchangeIncome`, default 150 bps); the **e-transfer fee** inline in
+  `send_etransfer` (default $1.50, Dr customer / Cr `FeeIncome`).
+
+Each batch posts a single balanced GL document *before* committing the local
+writes, so a core failure rolls back cleanly. Rates are tunable via
+`NANO_BANK__FINANCE__*` (`interchange_bps`, `etransfer_fee`, `maintenance_fee`,
+`maintenance_waiver`). Every posting is tagged (`product`, `cost_centre`,
+`economic_event_id`) on `transactions` / `interest_accruals` for the reporting
+specs. Cross-backend smoke: `testing/verify-nim-engine.sh` (run once per
+`CORE_BACKEND`).
+
+Sample cron (daily accrual at 02:00; monthly capitalisation on the 1st at 03:00 —
+the service token is minted from the network client secret):
+
+```cron
+0 2 * * *  curl -fsS -XPOST "$API/api/v1/finance/accrue"     -H "authorization: Bearer $SVC" -H 'content-type: application/json' -d "{\"as_of\":\"$(date +\%F)\"}"
+0 3 1 * *  curl -fsS -XPOST "$API/api/v1/finance/capitalise"  -H "authorization: Bearer $SVC" -H 'content-type: application/json' -d "{\"period\":\"$(date -d 'last month' +\%Y-\%m)\"}"
+```
 
 ## Gotchas
 

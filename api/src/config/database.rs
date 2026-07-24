@@ -142,6 +142,11 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
         "ALTER TYPE audit_action ADD VALUE IF NOT EXISTS 'revoke_mandate'",
         // Additive: DBs whose mandates table predates the Phase-2 payee allowlist.
         "ALTER TABLE mandates ADD COLUMN IF NOT EXISTS allowed_payees UUID[]",
+        // Economics tag columns (interest / NIM engine, spec #2). Additive; existing rows stay NULL.
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS product TEXT",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS cost_centre TEXT",
+        "ALTER TABLE transactions ADD COLUMN IF NOT EXISTS economic_event_id UUID",
+        "CREATE INDEX IF NOT EXISTS idx_transactions_event ON transactions(economic_event_id)",
         // Phase 3: step-up pending approvals.
         r#"
         CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -207,6 +212,50 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
          DROP CONSTRAINT IF EXISTS interac_recipients_customer_id_email_key",
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_interac_recipients_active \
          ON interac_recipients(customer_id, email) WHERE status = 'active'",
+        // Interest / NIM engine (spec #2): per-account accrual subledger + batch
+        // run ledgers. Self-heal for DBs predating the 13_interest_accruals DDL.
+        r#"
+        CREATE TABLE IF NOT EXISTS interest_accruals (
+            accrual_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            account_id        UUID NOT NULL REFERENCES accounts(account_id) ON DELETE RESTRICT,
+            accrual_date      DATE NOT NULL,
+            product           TEXT NOT NULL,
+            cost_centre       TEXT NOT NULL,
+            principal         DECIMAL(15,2) NOT NULL,
+            rate              DECIMAL(5,4) NOT NULL,
+            amount            DECIMAL(15,2) NOT NULL,
+            side              TEXT NOT NULL,
+            economic_event_id UUID NOT NULL,
+            capitalised       BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT chk_accrual_amount_precision CHECK (amount = ROUND(amount, 2))
+        )
+        "#,
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_interest_accruals_acct_date \
+         ON interest_accruals(account_id, accrual_date)",
+        "CREATE INDEX IF NOT EXISTS idx_interest_accruals_uncap \
+         ON interest_accruals(account_id) WHERE capitalised = FALSE",
+        r#"
+        CREATE TABLE IF NOT EXISTS accrual_runs (
+            accrual_date      DATE PRIMARY KEY,
+            economic_event_id UUID NOT NULL,
+            expense_total     DECIMAL(15,2) NOT NULL,
+            income_total      DECIMAL(15,2) NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'completed',
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS capitalisation_runs (
+            period            TEXT PRIMARY KEY,
+            economic_event_id UUID NOT NULL,
+            deposit_total     DECIMAL(15,2) NOT NULL,
+            asset_total       DECIMAL(15,2) NOT NULL,
+            maintenance_total DECIMAL(15,2) NOT NULL,
+            status            TEXT NOT NULL DEFAULT 'completed',
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        "#,
         // Notification-outbox drainer bookkeeping. Additive self-heal for DBs
         // predating the flush-notifications consumer: a retry counter (its budget
         // caps a permanently-failing send — a dead-letter, not an infinite loop),

@@ -382,13 +382,16 @@ async fn capture(
 
     // The core is the general ledger of record: post the aggregate GL effect of
     // the purchase (cardholder receivable up, network clearing payable up). The
-    // per-card subledger above stays local. Done before commit so a core failure
-    // fails the capture rather than letting the GL drift.
+    // cardholder receivable uses the granular `CardReceivable` role — the same
+    // role card-interest capitalisation raises — so the card asset is one GL
+    // quantity, not split across `Receivable`/`CardReceivable`. The per-card
+    // subledger above stays local. Done before commit so a core failure fails
+    // the capture rather than letting the GL drift.
     let gl = post_gl_entry(
         &state,
         &reference,
         &format!("Card purchase — {}", merchant),
-        GlAccount::Receivable,
+        GlAccount::CardReceivable,
         GlAccount::Payable,
         amount,
     )
@@ -399,6 +402,33 @@ async fn capture(
     )
     .bind(txn_id)
     .bind(format!("{}:{}", gl.backend, gl.id))
+    .execute(&mut *tx)
+    .await?;
+
+    // Recognize interchange income (issuer earns a bps cut on the purchase) and
+    // tag the purchase with its economics keys. Interchange is bank-vs-network, so
+    // it has no customer-account leg — a GL-only post, before commit like the
+    // purchase GL above.
+    let cfg = state.settings.finance_config();
+    let interchange = crate::finance::interchange_amount(amount, cfg.interchange_bps);
+    if interchange > Decimal::ZERO {
+        post_gl_entry(
+            &state,
+            &reference,
+            "Card interchange income",
+            GlAccount::CashReserves,
+            GlAccount::InterchangeIncome,
+            interchange,
+        )
+        .await?;
+    }
+    let event_id = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE transactions SET product = 'card', cost_centre = 'payments', \
+         economic_event_id = $2 WHERE transaction_id = $1",
+    )
+    .bind(txn_id)
+    .bind(event_id)
     .execute(&mut *tx)
     .await?;
 

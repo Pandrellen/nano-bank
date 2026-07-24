@@ -231,6 +231,15 @@ async fn send_etransfer(
         }
     };
 
+    // Charge the outgoing e-transfer fee (fee income), tagged, before commit.
+    crate::handlers::finance::charge_etransfer_fee(
+        &state,
+        &mut tx,
+        sender.account_id,
+        caller.customer_id,
+    )
+    .await?;
+
     tx.commit().await?;
     tracing::info!(%etransfer_id, status, "📨 e-Transfer sent");
     Ok((
