@@ -425,6 +425,9 @@ async fn cancel_by_non_sender_is_404_but_sender_can_cancel() {
     .await;
     assert!(resp.status().is_success(), "sender cancel: {}", resp.status());
     assert_eq!(get_etransfer(&c, &a_token, id).await["status"], "cancelled");
-    // Funds returned: started 500, sent 30 (held), cancelled -> back to 500.
-    assert_eq!(balance(&c, &a_token, from).await, 500.0);
+    // Funds returned: started 500; the send debits the $30 hold plus the flat
+    // $1.50 outgoing e-transfer fee (500 -> 468.50); cancelling refunds the $30
+    // hold but *not* the fee (the fee is earned when the transfer is sent), so the
+    // sender lands at 468.50 + 30 = 498.50.
+    assert_eq!(balance(&c, &a_token, from).await, 498.5);
 }

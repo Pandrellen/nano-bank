@@ -193,7 +193,7 @@ other core (a new entry id / `belnr`).
 (`available = overdraft_limit − balance − holds`).
 
 On top of that, `capture` and `settle` post the **aggregate GL effect** to the
-core via the port (capture: debit Receivable / credit Payable; settle: debit
+core via the port (capture: debit CardReceivable / credit Payable; settle: debit
 Payable / credit Bank), recording the core's document id in
 `transactions.metadata.gl_entry`. The GL post happens inside the capture/settle
 DB transaction, before commit — so if the core can't record it, the operation
@@ -204,8 +204,9 @@ local-only (a hold; no money moves).
 Deposit and withdrawal move value across an internal **`EXTERNAL_CASH`** account
 (a chequing account under a synthetic `cash@nano.bank` customer, $1T overdraft)
 and post the aggregate effect through the port (deposit: debit `Bank` / credit
-`Payable`; withdrawal the reverse). A **transfer is local-only** — both customer
-accounts map to the same `Payable` GL role, so the net GL effect is zero. All
+`CustomerDeposits`; withdrawal the reverse). A **transfer is local-only** — both
+customer accounts map to the same `CustomerDeposits` GL role, so the net GL effect
+is zero. All
 three enforce balance/status/type checks and the `account_limits` counters, and
 update `daily_transaction_summaries`; transfer honors an `idempotency_key`.
 
