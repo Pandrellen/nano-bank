@@ -231,11 +231,21 @@ The first **external payment rail**, built on a small `Rail` port that sits
   autodeposit (registered handle) / claim (security Q&A, argon2, 3-strike lock) /
   decline / cancel / expire (sweep). Inbound: autodeposit fast-path
   (`accept_inbound`) or held-then-claim. Notifications go to the
-  `interac_notifications` **outbox** table (no real email/SMS).
-- **Three auth planes**: customer (`/etransfers`, `/autodeposit`), service-token
-  **network** (`/network/inbound`, `/network/etransfers/:id/settle` — driven by
-  `testing/interac/interac_simulator.py`), service-token **admin**
-  (`/admin/sweep-expired`). The viewer (`testing/viewer`) has an Interac tab.
+  `interac_notifications` **outbox** table (no real email/SMS); the admin-plane
+  **drainer** (`POST /admin/flush-notifications`) consumes it — claims undelivered
+  rows race-safely (`FOR UPDATE SKIP LOCKED`, an atomic `delivery_attempts += 1`
+  claim so a crashed send just retries next tick), hands each to a delivery seam
+  (stubbed — the SMTP/SMS plug point), and dead-letters a row past its retry cap.
+  Triggered by a k8s CronJob (`k8s/interac-notification-drainer-cronjob.yaml`).
+- **Auth planes**: the *enforced* boundary is customer (`/etransfers`,
+  `/autodeposit`) vs service token — `AuthenticatedService` checks only
+  `role == Service`. Within the service token, **network** (`/network/inbound`,
+  `/network/etransfers/:id/settle` — driven by
+  `testing/interac/interac_simulator.py`) and **admin**
+  (`/admin/sweep-expired`, `/admin/flush-notifications`) are a routing/naming
+  convention, not separate credentials: the same secret opens both. Splitting
+  them would need a distinct admin credential. The viewer (`testing/viewer`) has
+  an Interac tab.
 - **`available_balance` note**: the balance trigger maintains only `balance`, so
   the handlers hand-recompute `available_balance` around rail posts on **customer**
   accounts; the system clearing/settlement accounts intentionally keep it at 0
