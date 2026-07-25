@@ -164,6 +164,13 @@ def create_app(settings: Settings, *, assist_fn=nano_manager.assist,
     _OP_SCOPE = {"transfer_out": "transfer:initiate", "open_account": "account:open",
                  "register_payee": "payee:register"}
 
+    # Error codes that may be echoed to the external agent: its own malformed
+    # request, its own dead credential, and transient states it should back off
+    # from. None of these say anything about an account. Every other code — and
+    # every bank message and body — stops at this boundary.
+    _AGENT_SAFE_CODES = {"VALIDATION_ERROR", "BAD_REQUEST", "MANDATE_INACTIVE",
+                         "RATE_LIMIT", "SERVICE_UNAVAILABLE"}
+
     @app.get("/agent-gateway/mandate")
     def gw_mandate(authorization: str = Header(None)):
         _gw_auth(authorization)
@@ -198,13 +205,25 @@ def create_app(settings: Settings, *, assist_fn=nano_manager.assist,
                 return {"decision": "pending_approval", "operation": op, "http": code,
                         "approval_id": (res or {}).get("approval_id"), "result": res}
             if code >= 400:
-                # The PEP cleared scope + max_per_tx, but the bank still rejected
-                # at the transaction layer — most often allowed_payees (403
-                # PAYEE_NOT_ALLOWED), which is enforced there, not in the PEP.
+                # The PEP cleared scope + max_per_tx, but the bank still refused at
+                # the transaction layer.
+                #
+                # Neither the bank's message nor its body crosses this line. The
+                # planner on the other side is LLM-driven and takes to_account_id
+                # from its own plan, so forwarding a cause-specific refusal handed
+                # it an oracle over the bank's account estate. The bank now returns
+                # one opaque TRANSFER_REFUSED for every refusal; this keeps that
+                # true even for an older bank, or a code this gateway doesn't know.
+                # The reason is not lost — the granting customer reads it in the
+                # mandate's activity view.
                 err = (res or {}).get("error") or {}
-                reason = err.get("message") or err.get("details") or f"bank rejected ({code})"
+                bank_code = err.get("code")
+                if bank_code in _AGENT_SAFE_CODES:
+                    reason = f"refused by the bank ({bank_code})"
+                else:
+                    reason = "refused by the bank"
                 return {"decision": "deny", "operation": op, "http": code,
-                        "reason": reason, "result": res}
+                        "reason": reason}
             return {"decision": "allow", "operation": op, "http": code, "result": res}
         from .bank import BankClient
         bank = BankClient(settings.nano_bank_api)
