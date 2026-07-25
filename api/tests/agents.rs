@@ -865,7 +865,22 @@ async fn payee_allowlist_pins_destinations() {
 
     let resp = agent_transfer(&c, &atoken, stranger, 50.0, &Uuid::new_v4().to_string()).await;
     assert_eq!(resp.status().as_u16(), 403, "payee not on the allowlist");
-    assert_eq!(error_code(resp).await, "POLICY_DENIED");
+    // Opaque to the agent now: a distinct PAYEE_NOT_ALLOWED let it enumerate its
+    // own allowlist and, by elimination, which candidate accounts exist. The owner
+    // still sees the real reason.
+    assert_eq!(error_code(resp).await, "TRANSFER_REFUSED");
+    if let Some(db) = test_db().await {
+        let audited: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM agent_actions WHERE mandate_id = $1 \
+             AND operation = 'transfer' AND decision = 'denied' \
+             AND reason = 'PAYEE_NOT_ALLOWED')",
+        )
+        .bind(mandate)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert!(audited, "owner still sees why it was refused");
+    }
 }
 
 #[tokio::test]
@@ -882,7 +897,9 @@ async fn transfer_guards() {
     let atoken = agent_token(&c, agent_id, &secret, read_only).await;
     let resp = agent_transfer(&c, &atoken, b, 10.0, &Uuid::new_v4().to_string()).await;
     assert_eq!(resp.status().as_u16(), 403, "scope missing");
-    assert_eq!(error_code(resp).await, "POLICY_DENIED");
+    // Transfer refusals are opaque. Reads still answer POLICY_DENIED: a read
+    // denial describes the agent's own mandate, not any account.
+    assert_eq!(error_code(resp).await, "TRANSFER_REFUSED");
 
     // An empty idempotency key is rejected before anything happens.
     let resp = c
@@ -921,7 +938,10 @@ async fn transfer_guards() {
     // A within-caps transfer that fails on FUNDS is still audited (the owner's
     // activity view has no blind spots), and its cap reservation rolled back.
     let resp = agent_transfer(&c, &atoken, b, 50.0, &Uuid::new_v4().to_string()).await;
-    assert_eq!(resp.status().as_u16(), 400, "insufficient funds");
+    // Was 400 INSUFFICIENT_FUNDS — a strict predicate on available_balance, so an
+    // agent could bisect the balance with free probes and never hold read:balance.
+    assert_eq!(resp.status().as_u16(), 403, "insufficient funds, refused opaquely");
+    assert_eq!(error_code(resp).await, "TRANSFER_REFUSED");
     assert_eq!(mandate_daily_used(&c, &token, mandate).await, 0.0);
     if let Some(db) = test_db().await {
         let audited: bool = sqlx::query_scalar(
@@ -1740,4 +1760,193 @@ async fn retry_during_execution_maps_to_the_same_ask() {
         dup.is_err(),
         "unique index must reject a duplicate open ask: {dup:?}"
     );
+}
+
+// --- disclosure to automated clients ---
+
+/// Every refusal an agent can provoke must be indistinguishable, byte for byte.
+///
+/// Before this, the causes were distinct — 404 for a destination that does not
+/// exist, 403 ACCOUNT_FROZEN, 400 INVALID_ACCOUNT_STATUS, 400 INSUFFICIENT_FUNDS,
+/// 403 POLICY_DENIED — and none of them consumed cap, so an agent holding only
+/// `transfer:initiate` had a free, unlimited five-way classifier for arbitrary
+/// accounts and could bisect its own funding balance without `read:balance`.
+#[tokio::test]
+async fn agent_refusals_are_indistinguishable() {
+    let c = client();
+    require_stack!(&c);
+    let (_customer, token) = session(&c).await;
+    // Unfunded on purpose: every probe below is refused before money moves.
+    let a = create_account(&c, &token, "chequing").await;
+    let known = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate =
+        grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, Some(vec![known])).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // Three different causes: an account that does not exist, an account that
+    // exists but is not on the allowlist, and the allowed account with no funds.
+    let probes = [
+        ("nonexistent destination", Uuid::new_v4()),
+        ("existing but not allowlisted", create_account(&c, &token, "savings").await),
+        ("allowlisted but unfunded", known),
+    ];
+    let mut seen: Vec<(u16, String)> = Vec::new();
+    for (label, destination) in probes {
+        let resp = agent_transfer(&c, &atoken, destination, 50.0, &Uuid::new_v4().to_string()).await;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap();
+        assert_eq!(status, 403, "{label} must refuse with 403");
+        seen.push((status, body));
+    }
+    assert!(
+        seen.windows(2).all(|w| w[0] == w[1]),
+        "refusals must be byte-identical, got {seen:?}"
+    );
+    assert!(seen[0].1.contains("TRANSFER_REFUSED"));
+
+    // No probe consumed cap, and the owner can still tell the three apart.
+    assert_eq!(mandate_daily_used(&c, &token, mandate).await, 0.0);
+    let Some(db) = test_db().await else { return };
+    let reasons: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT reason FROM agent_actions \
+         WHERE mandate_id = $1 AND operation = 'transfer' ORDER BY created_at",
+    )
+    .bind(mandate)
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    let reasons: Vec<String> = reasons.into_iter().filter_map(|r| r.0).collect();
+    assert!(
+        reasons.contains(&"PAYEE_NOT_ALLOWED".to_string())
+            && reasons.contains(&"INSUFFICIENT_FUNDS".to_string()),
+        "the owner's audit trail keeps the distinct reasons: {reasons:?}"
+    );
+}
+
+/// Registration stays open (a registered agent is inert until mandated) but is
+/// metered per address: it is an unauthenticated write sharing its pool with
+/// every money endpoint.
+#[tokio::test]
+async fn agent_registration_is_throttled_per_address() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+
+    // One real registration: proves the happy path and reveals the address the
+    // server sees (v4 or v6 loopback, depending on how localhost resolved).
+    let (agent_id, _secret) = register_agent(&c).await;
+    let ip: String =
+        sqlx::query_scalar("SELECT host(registered_ip) FROM agents WHERE agent_id = $1")
+            .bind(agent_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+    // Fill this address's window by seeding rows rather than hammering the
+    // endpoint: deterministic, fast, and independent of the configured limit.
+    sqlx::query(
+        "INSERT INTO agents (display_name, secret_hash, registered_ip) \
+         SELECT 'Throttle Filler', repeat('0', 64), $1::inet FROM generate_series(1, 200)",
+    )
+    .bind(&ip)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let resp = c
+        .post(format!("{}/api/v1/agents", base_url()))
+        .json(&json!({"display_name": "Throttle Probe", "description": "rate limit test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 429, "registration must be metered");
+    assert_eq!(error_code(resp).await, "RATE_LIMIT");
+
+    // Drain the window again: left behind, those rows would throttle every other
+    // test in this suite, since they all register from this same address.
+    sqlx::query("DELETE FROM agents WHERE display_name = 'Throttle Filler'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let after = c
+        .post(format!("{}/api/v1/agents", base_url()))
+        .json(&json!({"display_name": "Throttle Recovery", "description": "window cleared"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(after.status().as_u16(), 201, "the window recovers as it drains");
+}
+
+/// An ask nobody answers is a terminal outcome too, and the activity view now
+/// says so. Previously expiry only moved `pending_approvals.status`, leaving
+/// `step_up_required` as the last word in the audit trail.
+#[tokio::test]
+async fn unanswered_step_up_expiry_is_audited() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    let ask = park(&c, &atoken, b, 250.0, &format!("expiry-{}", Uuid::new_v4())).await;
+    let approval_id = ask["approval_id"].as_str().unwrap().to_string();
+
+    // Age the ask past its deadline (the window is minutes; the test can't wait).
+    sqlx::query(
+        "UPDATE pending_approvals SET expires_at = now() - interval '1 minute' \
+         WHERE approval_id = $1::uuid",
+    )
+    .bind(&approval_id)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // Any read by the owner runs reclaim-then-expire.
+    let listed = c
+        .get(format!("{}/api/v1/approvals", base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.status().is_success());
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM pending_approvals WHERE approval_id = $1::uuid")
+            .bind(&approval_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(status, "expired");
+
+    let audited: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM agent_actions WHERE mandate_id = $1 \
+         AND operation = 'transfer' AND decision = 'denied' \
+         AND reason = 'STEP_UP_EXPIRED')",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(audited, "expiry must leave a terminal audit row");
+
+    // Idempotent: a second read must not audit the same expiry again.
+    let _ = c
+        .get(format!("{}/api/v1/approvals", base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_actions WHERE mandate_id = $1 AND reason = 'STEP_UP_EXPIRED'",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(rows, 1, "expiry audited once, not on every read");
 }
