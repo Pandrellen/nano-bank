@@ -196,7 +196,18 @@ async fn initiate_wire(
         "{}:{}",
         req.counterparty_institution, req.counterparty_account
     );
-    crate::fraud::gate::screen(
+    // Idempotency replay: same (originating account, key) returns the original
+    // wire without re-sending. Checked before the funds/participant work AND
+    // before screening so a retry is cheap and never re-invokes the fraud
+    // engine (no double velocity-count, no spurious fail-closed on an
+    // already-sent wire); the partial unique index closes the concurrent-retry
+    // race.
+    if let Some(key) = &req.idempotency_key {
+        if let Some(existing) = load_wire_by_key(&state, req.from_account_id, key).await? {
+            return Ok((StatusCode::CREATED, Json(existing)));
+        }
+    }
+    let fraud_link = crate::fraud::gate::screen(
         &state,
         crate::fraud::gate::ScreenInput {
             kind: "lynx_transfer",
@@ -215,14 +226,6 @@ async fn initiate_wire(
         },
     )
     .await?;
-    // Idempotency replay: same (originating account, key) returns the original
-    // wire without re-sending. Checked before the funds/participant work so a
-    // retry is cheap; the partial unique index closes the concurrent-retry race.
-    if let Some(key) = &req.idempotency_key {
-        if let Some(existing) = load_wire_by_key(&state, req.from_account_id, key).await? {
-            return Ok((StatusCode::CREATED, Json(existing)));
-        }
-    }
     // Counterparty institution must be a Lynx-capable, active participant.
     let ok: Option<(bool, bool)> = sqlx::query_as(
         "SELECT supports_lynx, active FROM rail_participants WHERE institution_number = $1",
@@ -306,6 +309,8 @@ async fn initiate_wire(
 
     store_message(&mut tx, wire_id, "pacs.008", "emitted", &payload).await?;
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(%wire_id, %uetr, amount = %amount, "🌐 Lynx wire sent");
     Ok((StatusCode::CREATED, Json(load_wire(&state, wire_id).await?)))

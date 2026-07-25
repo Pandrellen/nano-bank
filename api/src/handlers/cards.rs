@@ -221,6 +221,7 @@ async fn authorize(
             .bind(req.account_id)
             .fetch_optional(&state.pool)
             .await?;
+    let mut fraud_link: Option<crate::fraud::gate::FraudLink> = None;
     if let Some((owner, available_balance)) = precheck {
         let screened = crate::fraud::gate::screen(
             &state,
@@ -242,7 +243,7 @@ async fn authorize(
         )
         .await;
         match screened {
-            Ok(_) => {}
+            Ok(link) => fraud_link = Some(link),
             Err(AppError::TransactionDeclined) | Err(AppError::TransactionUnderReview(_)) => {
                 return Ok((
                     StatusCode::OK,
@@ -320,6 +321,11 @@ async fn authorize(
 
     let available = recompute_card_available(&mut tx, card.account_id).await?;
     tx.commit().await?;
+    // Authorization approved (hold placed) — settle any deferred fail-open
+    // rescore as executed.
+    if let Some(link) = &fraud_link {
+        link.settle_rescore(&state, true);
+    }
 
     tracing::info!(
         account_id = %card.account_id, %auth_id, amount = %amount, merchant = %merchant,

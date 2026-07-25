@@ -69,7 +69,7 @@ impl Screening {
 }
 
 /// The linkage a caller stamps into `transactions.metadata.fraud`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct FraudLink {
     pub operation_id: Uuid,
     pub decision_id: Option<Uuid>,
@@ -77,6 +77,11 @@ pub(crate) struct FraudLink {
     /// False in off-mode: callers skip metadata stamping so the bank's
     /// money rows are byte-identical to pre-port behavior until opted in.
     pub screened: bool,
+    /// Deferred fail-open rescore payload — `Some` only when this screening
+    /// failed open. The caller fires it via [`FraudLink::settle_rescore`] once
+    /// the movement's outcome is known, so the engine learns whether the money
+    /// actually moved rather than a guess made before the DB transaction.
+    rescore: Option<Box<FraudRequest>>,
 }
 
 impl FraudLink {
@@ -88,6 +93,21 @@ impl FraudLink {
             "decision_id": self.decision_id,
             "failed_open": self.failed_open,
         })
+    }
+
+    /// Fire the deferred fail-open rescore now that the movement's outcome is
+    /// known. A no-op unless this screening failed open. Fire-and-forget: it
+    /// feeds only the engine's post-hoc case-opening (a bad verdict on money
+    /// that *did* move) and must never affect the request path — adapter errors
+    /// are swallowed. Callers pass `executed = true` after the movement's
+    /// transaction commits; a movement that aborted before commit simply drops
+    /// the link, so nothing is rescored (correctly — no money moved).
+    pub(crate) fn settle_rescore(&self, state: &AppState, executed: bool) {
+        if let Some(request) = &self.rescore {
+            let fraud = state.fraud.clone();
+            let request = (**request).clone();
+            tokio::spawn(async move { fraud.rescore(request, executed).await });
+        }
     }
 }
 
@@ -134,6 +154,7 @@ pub(crate) async fn screen(
             decision_id: None,
             failed_open: false,
             screened: false,
+            rescore: None,
         });
     }
 
@@ -175,6 +196,7 @@ pub(crate) async fn screen(
                     decision_id: Some(decision.decision_id),
                     failed_open: false,
                     screened: true,
+                    rescore: None,
                 }),
                 // The agent-plane audit for these is written by the caller's
                 // catch-all (handlers/agent_api.rs), which records EVERY failed
@@ -208,13 +230,16 @@ pub(crate) async fn screen(
                     error = %e,
                     "fraud check failed open"
                 );
-                let fraud = state.fraud.clone();
-                tokio::spawn(async move { fraud.rescore(request, true).await });
+                // The movement hasn't run yet (this is before the DB tx opens),
+                // so we can't know `executed` here. Defer the rescore into the
+                // link; the caller fires it after the movement's outcome is
+                // known (see FraudLink::settle_rescore).
                 Ok(FraudLink {
                     operation_id,
                     decision_id: None,
                     failed_open: true,
                     screened: true,
+                    rescore: Some(Box::new(request)),
                 })
             } else {
                 // FAIL CLOSED: above the risk threshold no money moves blind.

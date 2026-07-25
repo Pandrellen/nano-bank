@@ -83,6 +83,18 @@ async fn send_etransfer(
         )));
     }
     let recipient_handle = normalize_handle(req.recipient_handle_type, &req.recipient_handle_value);
+    let rail = resolve_interac(&state).await?;
+
+    // Idempotency replay: same (sender, key) returns the original. Checked
+    // BEFORE screening so a replayed retry returns the cached result without
+    // re-invoking the fraud engine (no double velocity-count, no spurious
+    // fail-closed on an already-sent e-Transfer).
+    if let Some(key) = &req.idempotency_key {
+        if let Some(existing) = load_etransfer_by_key(&state, caller.customer_id, key).await? {
+            return Ok((StatusCode::CREATED, Json(existing)));
+        }
+    }
+
     let fraud_link = crate::fraud::gate::screen(
         &state,
         crate::fraud::gate::ScreenInput {
@@ -102,15 +114,8 @@ async fn send_etransfer(
         },
     )
     .await?;
-    let _ = fraud_link; // linkage lives in the engine's decision log (rails keep their own rows)
-    let rail = resolve_interac(&state).await?;
-
-    // Idempotency replay: same (sender, key) returns the original.
-    if let Some(key) = &req.idempotency_key {
-        if let Some(existing) = load_etransfer_by_key(&state, caller.customer_id, key).await? {
-            return Ok((StatusCode::CREATED, Json(existing)));
-        }
-    }
+    // fraud_link is settled after the send commits below (metadata linkage
+    // lives in the engine's decision log; rails keep their own rows).
 
     // Look up whether the recipient handle is registered here, and autodeposit.
     let registration = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
@@ -264,6 +269,8 @@ async fn send_etransfer(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
     tracing::info!(%etransfer_id, status, "📨 e-Transfer sent");
     Ok((
         StatusCode::CREATED,

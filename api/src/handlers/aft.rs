@@ -372,7 +372,16 @@ async fn create_credit(
         "{}:{}:{}",
         req.counterparty_institution, req.counterparty_transit, req.counterparty_account
     );
-    crate::fraud::gate::screen(
+    // Idempotency replay: same (originating account, key) returns the original.
+    // Checked BEFORE screening so a replayed retry returns the cached result
+    // without re-invoking the fraud engine (no double velocity-count, no
+    // spurious fail-closed on an already-settled entry).
+    if let Some(key) = &req.idempotency_key {
+        if let Some(existing) = load_entry_by_key(&state, req.originator_account_id, key).await? {
+            return Ok((StatusCode::CREATED, Json(existing)));
+        }
+    }
+    let fraud_link = crate::fraud::gate::screen(
         &state,
         crate::fraud::gate::ScreenInput {
             kind: "aft_batch",
@@ -391,12 +400,6 @@ async fn create_credit(
         },
     )
     .await?;
-    // Idempotency replay: same (originating account, key) returns the original.
-    if let Some(key) = &req.idempotency_key {
-        if let Some(existing) = load_entry_by_key(&state, req.originator_account_id, key).await? {
-            return Ok((StatusCode::CREATED, Json(existing)));
-        }
-    }
     let mut tx = state.pool.begin().await?;
     let batch_id = open_batch(&mut tx).await?;
     let entry_id: Uuid = sqlx::query_scalar(
@@ -417,6 +420,8 @@ async fn create_credit(
     .map_err(originate_conflict)?;
     bump_batch(&mut tx, batch_id, amount, Decimal::ZERO).await?;
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
     Ok((
         StatusCode::CREATED,
         Json(load_entry(&state, entry_id).await?),
@@ -468,7 +473,16 @@ async fn create_debit(
     .await?;
     // Screen the pull: the payor being drafted is the fraud-relevant party
     // context; the collecting (from) account is the caller's.
-    crate::fraud::gate::screen(
+    // Idempotency replay: same (originating account, key) returns the original.
+    // Checked BEFORE screening so a replayed retry returns the cached result
+    // without re-invoking the fraud engine (no double velocity-count, no
+    // spurious fail-closed on an already-settled entry).
+    if let Some(key) = &req.idempotency_key {
+        if let Some(existing) = load_entry_by_key(&state, req.originator_account_id, key).await? {
+            return Ok((StatusCode::CREATED, Json(existing)));
+        }
+    }
+    let fraud_link = crate::fraud::gate::screen(
         &state,
         crate::fraud::gate::ScreenInput {
             kind: "aft_batch",
@@ -487,12 +501,6 @@ async fn create_debit(
         },
     )
     .await?;
-    // Idempotency replay: same (originating account, key) returns the original.
-    if let Some(key) = &req.idempotency_key {
-        if let Some(existing) = load_entry_by_key(&state, req.originator_account_id, key).await? {
-            return Ok((StatusCode::CREATED, Json(existing)));
-        }
-    }
     let mut tx = state.pool.begin().await?;
     let batch_id = open_batch(&mut tx).await?;
     let entry_id: Uuid = sqlx::query_scalar(
@@ -515,6 +523,8 @@ async fn create_debit(
     .map_err(originate_conflict)?;
     bump_batch(&mut tx, batch_id, Decimal::ZERO, amount).await?;
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
     Ok((
         StatusCode::CREATED,
         Json(load_entry(&state, entry_id).await?),

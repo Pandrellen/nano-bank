@@ -229,6 +229,8 @@ async fn deposit_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💰 deposit posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -339,6 +341,8 @@ async fn withdraw_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💸 withdrawal posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -656,6 +660,8 @@ pub(crate) async fn execute_transfer(
     }
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(state, true);
 
     tracing::info!(
         from = %from.account_id, to = %to.account_id, transaction_id = %txn_id, amount = %amount,
