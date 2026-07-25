@@ -233,8 +233,50 @@ async fn post_mandated_transfer(
                 let approval = park_pending_approval(&state, &agent, &req, amount, &reason).await?;
                 return Ok((StatusCode::ACCEPTED, Json(approval)).into_response());
             }
-            Err(err)
+            // The audit above kept the true reason; the agent gets one opaque
+            // refusal, because a cause-specific one is an oracle (see
+            // refusal_for_agent).
+            Err(refusal_for_agent(err))
         }
+    }
+}
+
+/// Collapse a refusal into what an automated client may learn.
+///
+/// Distinguishable refusals are an oracle: because the mandate's policy is
+/// evaluated before account state — and a failed attempt rolls back, consuming no
+/// cap — an agent holding only `transfer:initiate` could tell a nonexistent
+/// destination from a frozen one from a closed one from a credit card from one
+/// with insufficient funds, enumerate which accounts its own `allowed_payees`
+/// covers, and bisect its funding account's balance without ever being granted
+/// `read:balance`. Card networks collapse risk declines onto one generic code for
+/// exactly this reason.
+///
+/// Three buckets, so the API stays usable:
+/// - the agent's own malformed request stays specific (it must be fixable),
+/// - transient failures stay distinguishable (or clients retry blindly),
+/// - every refusal becomes one opaque code.
+///
+/// Nothing is lost: `agent_actions` still carries the true reason for the
+/// granting customer, who is the party entitled to it.
+pub(crate) fn refusal_for_agent(err: AppError) -> AppError {
+    match err {
+        // The agent's own bug — keep it debuggable.
+        AppError::Validation(_) | AppError::BadRequest(_) => err,
+        // Transient: the agent should back off and retry, so it must be able to
+        // tell these apart from a refusal.
+        AppError::ServiceUnavailable(_)
+        | AppError::RateLimit(_)
+        | AppError::Upstream { .. }
+        | AppError::Database(_)
+        | AppError::Internal(_) => err,
+        // Its own credential died — it cannot act on anything else, and hiding
+        // this would just make it retry forever.
+        AppError::MandateInactive => err,
+        // Everything else refused this transfer, and why is not the agent's
+        // business: funds, account existence, account status, account limits,
+        // payee allowlist, missing scope, risk.
+        _ => AppError::TransferRefused,
     }
 }
 
