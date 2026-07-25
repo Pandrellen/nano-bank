@@ -1,0 +1,567 @@
+//! Integration tests for the FraudCheck port.
+//!
+//! Same harness as `tests/transactions.rs`: every test probes `GET /health`
+//! and **skips (still passes)** when the API isn't running.
+//!
+//! Two tiers:
+//! - The baseline test runs in ANY fraud mode (off or engine): money movement
+//!   must keep working — the port's first promise is zero behavior change by
+//!   default.
+//! - The engine-mode tests additionally require the fraud engine live and the
+//!   bank started with `NANO_BANK__FRAUD__BACKEND=engine`; they skip unless
+//!   `FRAUD_E2E=1` is set (the harness can't introspect the bank's backend).
+//!
+//! Run the full tier against a live stack:
+//! ```bash
+//! # engine repo: ./start-engine.sh   bank: NANO_BANK__FRAUD__BACKEND=engine cargo run
+//! cd api && FRAUD_E2E=1 cargo test --test fraud_port -- --nocapture
+//! ```
+//! Overrides: `NANO_BANK_TEST_URL`, `NANO_BANK_TEST_DB_URL`,
+//! `FRAUD_ENGINE_TEST_URL` (default http://localhost:8092),
+//! `FRAUD_ADMIN_TOKEN` (default dev-admin-token).
+
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+const TEST_PASSWORD: &str = "securepass123";
+
+fn base_url() -> String {
+    std::env::var("NANO_BANK_TEST_URL").unwrap_or_else(|_| "http://localhost:8081".to_string())
+}
+
+fn engine_url() -> String {
+    std::env::var("FRAUD_ENGINE_TEST_URL").unwrap_or_else(|_| "http://localhost:8092".to_string())
+}
+
+fn admin_token() -> String {
+    std::env::var("FRAUD_ADMIN_TOKEN").unwrap_or_else(|_| "dev-admin-token".to_string())
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+async fn stack_up(c: &reqwest::Client) -> bool {
+    matches!(
+        c.get(format!("{}/health", base_url())).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+async fn engine_up(c: &reqwest::Client) -> bool {
+    matches!(
+        c.get(format!("{}/health", engine_url())).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+macro_rules! require_stack {
+    ($c:expr) => {
+        if !stack_up($c).await {
+            eprintln!("SKIP: bank API not reachable");
+            return;
+        }
+    };
+}
+
+macro_rules! require_fraud_e2e {
+    ($c:expr) => {
+        if std::env::var("FRAUD_E2E").as_deref() != Ok("1") {
+            eprintln!(
+                "SKIP: set FRAUD_E2E=1 (bank must run with NANO_BANK__FRAUD__BACKEND=engine)"
+            );
+            return;
+        }
+        if !engine_up($c).await {
+            eprintln!("SKIP: fraud engine not reachable");
+            return;
+        }
+    };
+}
+
+async fn create_customer(c: &reqwest::Client) -> (Uuid, String) {
+    let n = Uuid::new_v4().as_u128();
+    let email = format!("fraudtest_{}@example.com", n % 1_000_000_000);
+    let body = json!({
+        "email": email,
+        "phone_number": format!("{:010}", (n % 10_000_000_000u128)),
+        "first_name": "Fraud",
+        "last_name": "Port",
+        "date_of_birth": "1990-01-01",
+        "sin": format!("{:09}", n % 1_000_000_000),
+        "password": TEST_PASSWORD
+    });
+    let resp = c
+        .post(format!("{}/api/v1/customers", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create customer: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.unwrap();
+    (
+        Uuid::parse_str(v["customer_id"].as_str().unwrap()).unwrap(),
+        email,
+    )
+}
+
+/// Login carrying a device fingerprint — the context the fraud engine keys
+/// device rules and blocklists on (recovered per-transaction via the session).
+async fn login_with_device(c: &reqwest::Client, email: &str, device: &str) -> String {
+    let resp = c
+        .post(format!("{}/api/v1/auth/login", base_url()))
+        .json(&json!({
+            "email": email,
+            "password": TEST_PASSWORD,
+            "device_fingerprint": device
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "login: {}", resp.status());
+    let v: Value = resp.json().await.unwrap();
+    v["access_token"].as_str().unwrap().to_string()
+}
+
+async fn create_account(c: &reqwest::Client, token: &str) -> Uuid {
+    let resp = c
+        .post(format!("{}/api/v1/accounts", base_url()))
+        .bearer_auth(token)
+        .json(&json!({ "account_type": "chequing" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create account: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.unwrap();
+    Uuid::parse_str(v["account_id"].as_str().unwrap()).unwrap()
+}
+
+/// Deposit; skips (None) when the GL core is down — same convention as
+/// `tests/transactions.rs::seed_deposit`.
+async fn seed_deposit(c: &reqwest::Client, token: &str, account: Uuid, amount: f64) -> Option<()> {
+    let resp = c
+        .post(format!("{}/api/v1/transactions/deposit", base_url()))
+        .bearer_auth(token)
+        .json(&json!({ "account_id": account, "amount": amount, "description": "seed" }))
+        .send()
+        .await
+        .unwrap();
+    if resp.status().as_u16() == 503 {
+        eprintln!("SKIP: GL core unavailable (deposit returned 503)");
+        return None;
+    }
+    assert!(resp.status().is_success(), "deposit: {}", resp.status());
+    Some(())
+}
+
+async fn transfer(
+    c: &reqwest::Client,
+    token: &str,
+    from: Uuid,
+    to: Uuid,
+    amount: f64,
+) -> reqwest::Response {
+    c.post(format!("{}/api/v1/transactions/transfer", base_url()))
+        .bearer_auth(token)
+        .json(&json!({
+            "from_account_id": from,
+            "to_account_id": to,
+            "amount": amount,
+            "description": "fraud port test"
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn register_agent(c: &reqwest::Client) -> (Uuid, String) {
+    let v: Value = c
+        .post(format!("{}/api/v1/agents", base_url()))
+        .json(&json!({"display_name": "Fraud Port Agent", "description": "fraud_port e2e"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        Uuid::parse_str(v["agent_id"].as_str().unwrap()).unwrap(),
+        v["agent_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn mandated_agent_token(c: &reqwest::Client, token: &str, account: Uuid) -> (Uuid, String) {
+    let (agent_id, secret) = register_agent(c).await;
+    let granted: Value = c
+        .post(format!("{}/api/v1/mandates", base_url()))
+        .bearer_auth(token)
+        .json(&json!({
+            "agent_id": agent_id,
+            "account_id": account,
+            "scopes": ["transfer:initiate"],
+            // Caps are mandatory with transfer:initiate; both sit above the test
+            // amount so the refusal comes from the engine, not the step-up path.
+            "max_per_tx": 100,
+            "daily_cap": 500,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mandate = Uuid::parse_str(granted["mandate_id"].as_str().unwrap()).unwrap();
+    let issued: Value = c
+        .post(format!("{}/api/v1/auth/agent-token", base_url()))
+        .json(&json!({"agent_id": agent_id, "agent_secret": secret, "mandate_id": mandate}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        mandate,
+        issued["access_token"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn agent_transfer(
+    c: &reqwest::Client,
+    atoken: &str,
+    to: Uuid,
+    amount: f64,
+) -> reqwest::Response {
+    c.post(format!("{}/api/v1/agent/transfers", base_url()))
+        .bearer_auth(atoken)
+        .json(&json!({
+            "to_account_id": to,
+            "amount": amount,
+            "description": "agent payment",
+            "idempotency_key": Uuid::new_v4().to_string(),
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn engine_list_add(c: &reqwest::Client, list: &str, key: &str) -> Value {
+    let created = c
+        .post(format!("{}/admin/v1/lists", engine_url()))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .json(&json!({"list_name": list, "entry_key": key, "reason": "fraud_port e2e test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 201, "engine list add");
+    created.json().await.unwrap()
+}
+
+async fn engine_list_revoke(c: &reqwest::Client, entry: &Value) {
+    let revoked = c
+        .delete(format!(
+            "{}/admin/v1/lists/{}",
+            engine_url(),
+            entry["entry_id"].as_str().unwrap()
+        ))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status().as_u16(), 204, "engine list revoke");
+}
+
+/// The engine's own database, for asserting what it did — or did not — record.
+/// `None` with a SKIP note when unreachable, same convention as `test_db`.
+async fn engine_db() -> Option<sqlx::PgPool> {
+    let url = std::env::var("FRAUD_ENGINE_TEST_DB_URL")
+        .unwrap_or_else(|_| "postgres://fraud:fraud@localhost:5436/fraud_engine".to_string());
+    match sqlx::PgPool::connect(&url).await {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            eprintln!("SKIP engine DB assertions: {e}");
+            None
+        }
+    }
+}
+
+async fn test_db() -> Option<sqlx::PgPool> {
+    let url = std::env::var("NANO_BANK_TEST_DB_URL").unwrap_or_else(|_| {
+        "postgres://nanobank_user:secure_nano_password_2024!@[::1]:5432/nano_bank_db".to_string()
+    });
+    match sqlx::PgPool::connect(&url).await {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            eprintln!("SKIP DB assertions: {e}");
+            None
+        }
+    }
+}
+
+/// Tier 1 — any mode: the port's default must not change bank behavior.
+#[tokio::test]
+async fn transfers_still_work_with_port_in_place() {
+    let c = client();
+    require_stack!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, "fraud-port-baseline-device").await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+    let resp = transfer(&c, &token, from, to, 50.0).await;
+    assert!(resp.status().is_success(), "transfer: {}", resp.status());
+}
+
+/// Tier 2 — engine mode: an allowed transfer carries the engine linkage in
+/// `transactions.metadata.fraud` (decision_id proves the round trip).
+#[tokio::test]
+async fn engine_mode_stamps_decision_linkage() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, format!("dev-{}", Uuid::new_v4()).as_str()).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+    let resp = transfer(&c, &token, from, to, 40.0).await;
+    assert!(resp.status().is_success(), "transfer: {}", resp.status());
+    let v: Value = resp.json().await.unwrap();
+    let txn_id = Uuid::parse_str(v["transaction_id"].as_str().unwrap()).unwrap();
+
+    let Some(pool) = test_db().await else { return };
+    let (op_id, decision_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT metadata->'fraud'->>'operation_id', metadata->'fraud'->>'decision_id' \
+         FROM transactions WHERE transaction_id = $1",
+    )
+    .bind(txn_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(op_id.is_some(), "fraud.operation_id stamped");
+    assert!(
+        decision_id.is_some(),
+        "fraud.decision_id stamped (engine round trip)"
+    );
+}
+
+/// Tier 2 — engine mode: an engine refusal on the AGENT plane leaves exactly one
+/// audit row, carrying the risk reason.
+///
+/// Regression guard. The gate used to audit the decline itself while the agent
+/// handler's catch-all audited every failure too, so the owner's activity view
+/// showed the real `RISK_REVIEW` beside a contradictory `denied / INTERNAL` — the
+/// catch-all had no arm for the fraud errors. One writer, one row, right reason.
+#[tokio::test]
+async fn engine_mode_agent_refusal_audits_once() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, &format!("agent-dev-{}", Uuid::new_v4())).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+
+    // The engine watches the destination, so any payment to it is held. No funding
+    // needed: screening happens before the money transaction opens.
+    let entry = engine_list_add(&c, "account_watch", &to.to_string()).await;
+    let (mandate, atoken) = mandated_agent_token(&c, &token, from).await;
+
+    let resp = agent_transfer(&c, &atoken, to, 40.0).await;
+    assert_eq!(resp.status().as_u16(), 403, "watched destination must 403");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "TRANSACTION_UNDER_REVIEW");
+
+    if let Some(db) = test_db().await {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT decision, reason FROM agent_actions \
+             WHERE mandate_id = $1 AND operation = 'transfer' ORDER BY created_at",
+        )
+        .bind(mandate)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("denied".to_string(), Some("RISK_REVIEW".to_string()))],
+            "exactly one audit row, with the risk reason"
+        );
+    }
+    engine_list_revoke(&c, &entry).await;
+}
+
+/// Tier 2 — engine mode: a device the fraud engine blocklists makes the bank
+/// refuse the movement with the opaque decline, before any money moves.
+#[tokio::test]
+async fn engine_mode_blocked_device_declines() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let device = format!("blocked-dev-{}", Uuid::new_v4());
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, &device).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+
+    // Analyst blocks the device on the engine side...
+    let created = c
+        .post(format!("{}/admin/v1/lists", engine_url()))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .json(&json!({
+            "list_name": "device_block",
+            "entry_key": device,
+            "reason": "fraud_port e2e test"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 201, "engine blocklist add");
+    let entry: Value = created.json().await.unwrap();
+
+    // ...and the bank now refuses this session's transfers, opaquely.
+    let resp = transfer(&c, &token, from, to, 40.0).await;
+    assert_eq!(resp.status().as_u16(), 403, "blocked device must 403");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "TRANSACTION_DECLINED");
+
+    // Cleanup: revoke so repeated runs stay independent.
+    let revoked = c
+        .delete(format!(
+            "{}/admin/v1/lists/{}",
+            engine_url(),
+            entry["entry_id"].as_str().unwrap()
+        ))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status().as_u16(), 204, "engine blocklist revoke");
+}
+
+/// Tier 2 — engine mode: a retried rail movement must NOT reach the engine again.
+///
+/// The four rail handlers used to screen *before* their idempotency replay, so a
+/// bank retry of an already-posted AFT/Interac/Lynx movement re-invoked the
+/// engine: velocity counted twice, a second decision row per retry, and above
+/// `fail_closed_above` a 503 for a request that had already succeeded
+/// (`design/INTEGRATION_DESIGN.md` §5 requires the replay to short-circuit
+/// first). The ordering is invisible on inspection — two adjacent blocks — so it
+/// gets a test rather than a comment.
+///
+/// Uses the AFT credit rail deliberately: originating accrues into the open batch
+/// and moves no money until settlement, so the assertion needs no funded account
+/// and runs where the funded-flow tests skip.
+#[tokio::test]
+async fn engine_mode_retried_rail_send_is_not_rescreened() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, &format!("rail-dev-{}", Uuid::new_v4())).await;
+    let from = create_account(&c, &token).await;
+
+    // A FRESH counterparty per run, not a fixed one: the engine tracks payee-side
+    // velocity, so a hardcoded account accumulates inbound attempts across runs
+    // until `payee_inbound_24h_high` joins the novelty codes and the engine starts
+    // holding the originate — a self-poisoning test.
+    let counterparty_account = format!("{:07}", Uuid::new_v4().as_u128() % 10_000_000);
+    let key = format!("rail-idem-{}", Uuid::new_v4());
+    let body = json!({
+        "originator_account_id": from,
+        "counterparty_institution": "003",
+        "counterparty_transit": "12345",
+        "counterparty_account": counterparty_account,
+        "payee_name": "Utility Co",
+        "amount": 40.0,
+        "idempotency_key": key,
+    });
+    let originate = |b: serde_json::Value| {
+        let c = c.clone();
+        let token = token.clone();
+        async move {
+            c.post(format!("{}/api/v1/aft/credits", base_url()))
+                .bearer_auth(&token)
+                .json(&b)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let first = originate(body.clone()).await;
+    assert_eq!(first.status().as_u16(), 201, "first originate");
+    let first_id = first.json::<Value>().await.unwrap()["entry_id"].clone();
+
+    let replay = originate(body).await;
+    assert_eq!(replay.status().as_u16(), 201, "replay returns the original");
+    assert_eq!(
+        replay.json::<Value>().await.unwrap()["entry_id"],
+        first_id,
+        "replay must be the same entry, not a second one"
+    );
+
+    // Counting decision ROWS cannot detect this: the engine is idempotent on the
+    // same key, so a re-screened retry replays the stored decision instead of
+    // inserting another. What it cannot undo is the velocity it already counted —
+    // the engine records every assessed attempt before it notices the replay.
+    //
+    // So drive one further originate under a fresh key and read the velocity the
+    // engine saw for this customer. Exactly one prior attempt means the retry
+    // never reached it; two means it did.
+    let probe_key = format!("rail-probe-{}", Uuid::new_v4());
+    let probe = originate(json!({
+        "originator_account_id": from,
+        "counterparty_institution": "003",
+        "counterparty_transit": "12345",
+        "counterparty_account": counterparty_account,
+        "payee_name": "Utility Co",
+        "amount": 41.0,
+        "idempotency_key": probe_key,
+    }))
+    .await;
+    assert_eq!(probe.status().as_u16(), 201, "probe originate");
+
+    if let Some(db) = engine_db().await {
+        let vector: Value = sqlx::query_scalar(
+            "SELECT feature_vector FROM decisions WHERE idempotency_key LIKE $1",
+        )
+        .bind(format!("%{probe_key}"))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let counts: Vec<(String, i64)> = vector
+            .as_object()
+            .expect("feature vector object")
+            .iter()
+            .filter(|(k, _)| k.starts_with("velocity:customer_id:"))
+            .map(|(k, v)| (k.clone(), v["count"].as_i64().unwrap_or(-1)))
+            .collect();
+        assert!(!counts.is_empty(), "no customer velocity in {vector}");
+        for (key, count) in &counts {
+            assert_eq!(
+                *count, 1,
+                "the engine should have seen ONE prior originate, not {count} ({key}) — \
+                 a retry was re-screened and double-counted velocity"
+            );
+        }
+    }
+}

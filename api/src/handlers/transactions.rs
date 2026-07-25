@@ -44,6 +44,8 @@ use validator::Validate;
 
 use crate::config::database::DatabasePool;
 use crate::errors::AppError;
+use crate::fraud::gate::{screen, FraudLink, ScreenInput, Screening};
+use crate::fraud::FraudAgentCtx;
 use crate::handlers::cards::{
     fetch_account_for_update, normalize_amount, post_gl_entry, post_two_legged, reference_number,
     Tx,
@@ -148,6 +150,29 @@ async fn deposit_money(
 ) -> Result<(StatusCode, Json<TransactionResponse>), AppError> {
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
+    let fraud_link = screen(
+        &state,
+        ScreenInput {
+            kind: "deposit",
+            amount,
+            customer_id: auth.customer_id,
+            from_account_id: req.account_id,
+            // Self-directed: a deposit's destination is the customer's own
+            // account, not a payee — sending it as one would make every first
+            // large deposit trip payee-novelty rules. Velocity/device/dormancy
+            // signals still apply via the account and session subjects.
+            to_account_id: None,
+            payee_handle: None,
+            description: Some(&req.description),
+            external_reference: req.external_reference.as_deref(),
+            merchant: None,
+            idempotency_key: None,
+            channel: "web",
+            session_id: auth.session_id,
+            agent: None,
+        },
+    )
+    .await?;
     let cash_id = ensure_external_cash_account(&state.pool).await?;
 
     let mut tx = state.pool.begin().await?;
@@ -166,6 +191,10 @@ async fn deposit_money(
     ensure_operable(account)?;
 
     let reference = reference_number("DEP");
+    let mut metadata = json!({});
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
+    }
     let txn_id = insert_transaction(
         &mut tx,
         &reference,
@@ -174,7 +203,7 @@ async fn deposit_money(
         &req.description,
         account.customer_id,
         req.external_reference.as_deref(),
-        json!({}),
+        metadata,
     )
     .await?;
 
@@ -200,6 +229,8 @@ async fn deposit_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💰 deposit posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -220,6 +251,25 @@ async fn withdraw_money(
 ) -> Result<(StatusCode, Json<TransactionResponse>), AppError> {
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
+    let fraud_link = screen(
+        &state,
+        ScreenInput {
+            kind: "withdrawal",
+            amount,
+            customer_id: auth.customer_id,
+            from_account_id: req.account_id,
+            to_account_id: None,
+            payee_handle: None,
+            description: Some(&req.description),
+            external_reference: req.external_reference.as_deref(),
+            merchant: None,
+            idempotency_key: None,
+            channel: "web",
+            session_id: auth.session_id,
+            agent: None,
+        },
+    )
+    .await?;
     let cash_id = ensure_external_cash_account(&state.pool).await?;
 
     let mut tx = state.pool.begin().await?;
@@ -246,6 +296,10 @@ async fn withdraw_money(
     }
 
     let reference = reference_number("WTH");
+    let mut metadata = json!({});
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
+    }
     let txn_id = insert_transaction(
         &mut tx,
         &reference,
@@ -254,7 +308,7 @@ async fn withdraw_money(
         &req.description,
         account.customer_id,
         req.external_reference.as_deref(),
-        json!({}),
+        metadata,
     )
     .await?;
 
@@ -287,6 +341,8 @@ async fn withdraw_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💸 withdrawal posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -341,6 +397,7 @@ async fn transfer_money(
             idempotency_key: req.idempotency_key.as_deref(),
             agent: None,
         },
+        Screening::customer(auth.session_id),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(resp)))
@@ -379,6 +436,7 @@ pub(crate) async fn execute_transfer(
     state: &AppState,
     customer_id: Uuid,
     spec: TransferSpec<'_>,
+    screening: Screening,
 ) -> Result<TransactionResponse, AppError> {
     let amount = spec.amount;
 
@@ -387,6 +445,41 @@ pub(crate) async fn execute_transfer(
             "from and to accounts must differ".to_string(),
         ));
     }
+
+    // Fraud screening BEFORE the transaction opens: a decline must not cost a
+    // row lock, and the 150ms engine budget must never run under one.
+    let scoped_key;
+    let screen_key = match (screening.screen_scope, spec.idempotency_key) {
+        (Some(scope), Some(key)) => {
+            scoped_key = format!("{scope}:{key}");
+            Some(scoped_key.as_str())
+        }
+        (_, key) => key,
+    };
+    let fraud_link: FraudLink = screen(
+        state,
+        ScreenInput {
+            kind: "transfer",
+            amount,
+            customer_id,
+            from_account_id: spec.from_account_id,
+            to_account_id: Some(spec.to_account_id),
+            payee_handle: None,
+            description: Some(spec.description),
+            external_reference: spec.external_reference,
+            merchant: None,
+            idempotency_key: screen_key,
+            channel: screening.channel,
+            session_id: screening.session_id,
+            agent: spec.agent.as_ref().map(|a| FraudAgentCtx {
+                agent_id: a.agent_id,
+                mandate_id: a.mandate_id,
+                cap_override: a.cap_override,
+                approval_latency_seconds: screening.approval_latency_seconds,
+            }),
+        },
+    )
+    .await?;
 
     let fee = transfer_fee();
     let cash_id = ensure_external_cash_account(&state.pool).await?;
@@ -457,6 +550,10 @@ pub(crate) async fn execute_transfer(
     if let Some(agent) = &spec.agent {
         metadata["agent_id"] = json!(agent.agent_id);
         metadata["mandate_id"] = json!(agent.mandate_id);
+    }
+    // Fraud linkage: the audit join path to the engine's decision log.
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
     }
     let txn_id = insert_transaction(
         &mut tx,
@@ -563,6 +660,8 @@ pub(crate) async fn execute_transfer(
     }
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(state, true);
 
     tracing::info!(
         from = %from.account_id, to = %to.account_id, transaction_id = %txn_id, amount = %amount,
