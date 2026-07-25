@@ -6,8 +6,10 @@
 //! exactly once, and stored only as a SHA-256 hash (the refresh-token pattern —
 //! high-entropy random, so a fast hash is fine; argon2id stays for passwords).
 
+use std::net::SocketAddr;
+
 use axum::{
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, State},
     http::StatusCode,
     response::Json,
     routing::{get, post},
@@ -29,21 +31,50 @@ pub fn agent_routes() -> Router<AppState> {
 
 /// Register an agent. Public by design (a registered agent can do nothing
 /// until mandated); returns the secret exactly once.
+///
+/// Open, but no longer unmetered. Registration is an unauthenticated write that
+/// shares its connection pool with every money endpoint, so one address gets
+/// `max_agent_registrations` per `agent_registration_window` seconds and then a
+/// 429 — the same windowed-count shape as the login lockout. Deliberately a
+/// throttle rather than an authentication requirement: the consent UI already
+/// registers while logged in, but the demo seeding paths
+/// (`agent/mandate_gateway.py`, `mcp/setup_demo.py`) register anonymously and
+/// should keep working.
 async fn register_agent(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(req): Json<RegisterAgentRequest>,
 ) -> Result<(StatusCode, Json<RegisterAgentResponse>), AppError> {
     req.validate()?;
 
+    let ip = addr.ip().to_string();
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agents \
+         WHERE registered_ip = $1::inet \
+           AND created_at > now() - ($2 * interval '1 second')",
+    )
+    .bind(&ip)
+    .bind(state.settings.security.agent_registration_window as i64)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    if recent >= state.settings.security.max_agent_registrations as i64 {
+        return Err(AppError::RateLimit(
+            "Too many agent registrations; try again later".to_string(),
+        ));
+    }
+
     let secret = generate_opaque_secret();
     let (agent_id, kind, status): (Uuid, String, String) = sqlx::query_as(
-        "INSERT INTO agents (display_name, description, secret_hash) \
-         VALUES ($1, $2, encode(digest($3, 'sha256'), 'hex')) \
+        "INSERT INTO agents (display_name, description, secret_hash, registered_ip) \
+         VALUES ($1, $2, encode(digest($3, 'sha256'), 'hex'), $4::inet) \
          RETURNING agent_id, kind, status",
     )
     .bind(&req.display_name)
     .bind(req.description.as_deref())
     .bind(&secret)
+    .bind(&ip)
     .fetch_one(&state.pool)
     .await
     .map_err(AppError::Database)?;

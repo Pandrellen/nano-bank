@@ -266,6 +266,12 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
          ADD COLUMN IF NOT EXISTS last_delivery_error TEXT",
         "ALTER TABLE interac_notifications \
          ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMP WITH TIME ZONE",
+        // Registration provenance, and what the per-address registration
+        // throttle counts (handlers/agents.rs). Nullable: rows registered before
+        // this existed simply do not count toward anyone's window.
+        "ALTER TABLE agents ADD COLUMN IF NOT EXISTS registered_ip INET",
+        "CREATE INDEX IF NOT EXISTS idx_agents_registered_ip \
+         ON agents (registered_ip, created_at) WHERE registered_ip IS NOT NULL",
     ] {
         sqlx::query(ddl).execute(pool).await?;
     }

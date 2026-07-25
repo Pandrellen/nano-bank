@@ -118,6 +118,21 @@ pub struct SecuritySettings {
     /// Shared secret presented by the card network/processor to mint a service
     /// token at `POST /auth/service-token` (OAuth client-credentials style).
     pub service_client_secret: String,
+    /// Agent registrations allowed from one address per window. Registration is
+    /// unauthenticated by design, so it needs a meter rather than a credential.
+    /// Defaulted so an existing config file keeps loading.
+    #[serde(default = "default_max_agent_registrations")]
+    pub max_agent_registrations: u32,
+    #[serde(default = "default_agent_registration_window")]
+    pub agent_registration_window: u64,
+}
+
+fn default_max_agent_registrations() -> u32 {
+    60
+}
+
+fn default_agent_registration_window() -> u64 {
+    60
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -279,6 +294,8 @@ impl Default for Settings {
                 session_timeout: 86400, // 24 hours
                 require_mfa: false,
                 service_client_secret: "nano-bank-visa-network-secret-change-me".to_string(),
+                max_agent_registrations: default_max_agent_registrations(),
+                agent_registration_window: default_agent_registration_window(),
             },
             logging: LoggingSettings {
                 level: "info".to_string(),
