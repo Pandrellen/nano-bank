@@ -83,16 +83,38 @@ async fn expire_overdue(
     .execute(pool)
     .await
     .map_err(AppError::Database)?;
-    sqlx::query(
+    // Expiry is a terminal outcome for the agent's ask, so it is audited like the
+    // other two: an ask the customer simply never answered used to leave
+    // `step_up_required` as its last word in the activity view, with the real
+    // ending visible only in pending_approvals.status.
+    let expired: Vec<(Uuid, Uuid, Uuid, Uuid, Decimal)> = sqlx::query_as(
         "UPDATE pending_approvals \
          SET status = 'expired', resolved_at = CURRENT_TIMESTAMP \
          WHERE customer_id = $1 AND status = 'pending' \
-           AND expires_at <= CURRENT_TIMESTAMP",
+           AND expires_at <= CURRENT_TIMESTAMP \
+         RETURNING approval_id, mandate_id, agent_id, account_id, amount",
     )
     .bind(customer_id)
-    .execute(pool)
+    .fetch_all(pool)
     .await
     .map_err(AppError::Database)?;
+    for (approval_id, mandate_id, agent_id, account_id, amount) in expired {
+        policy::record_action(
+            pool,
+            mandate_id,
+            agent_id,
+            customer_id,
+            account_id,
+            "transfer",
+            Some(amount),
+            "denied",
+            Some(policy::REASON_STEP_UP_EXPIRED),
+            None,
+        )
+        .await
+        .map_err(AppError::Database)?;
+        tracing::info!(approval_id = %approval_id, "step-up ask expired unanswered");
+    }
     Ok(())
 }
 
