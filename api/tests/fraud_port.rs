@@ -198,11 +198,7 @@ async fn register_agent(c: &reqwest::Client) -> (Uuid, String) {
     )
 }
 
-async fn mandated_agent_token(
-    c: &reqwest::Client,
-    token: &str,
-    account: Uuid,
-) -> (Uuid, String) {
+async fn mandated_agent_token(c: &reqwest::Client, token: &str, account: Uuid) -> (Uuid, String) {
     let (agent_id, secret) = register_agent(c).await;
     let granted: Value = c
         .post(format!("{}/api/v1/mandates", base_url()))
@@ -233,7 +229,10 @@ async fn mandated_agent_token(
         .json()
         .await
         .unwrap();
-    (mandate, issued["access_token"].as_str().unwrap().to_string())
+    (
+        mandate,
+        issued["access_token"].as_str().unwrap().to_string(),
+    )
 }
 
 async fn agent_transfer(
@@ -281,6 +280,20 @@ async fn engine_list_revoke(c: &reqwest::Client, entry: &Value) {
         .await
         .unwrap();
     assert_eq!(revoked.status().as_u16(), 204, "engine list revoke");
+}
+
+/// The engine's own database, for asserting what it did — or did not — record.
+/// `None` with a SKIP note when unreachable, same convention as `test_db`.
+async fn engine_db() -> Option<sqlx::PgPool> {
+    let url = std::env::var("FRAUD_ENGINE_TEST_DB_URL")
+        .unwrap_or_else(|_| "postgres://fraud:fraud@localhost:5436/fraud_engine".to_string());
+    match sqlx::PgPool::connect(&url).await {
+        Ok(pool) => Some(pool),
+        Err(e) => {
+            eprintln!("SKIP engine DB assertions: {e}");
+            None
+        }
+    }
 }
 
 async fn test_db() -> Option<sqlx::PgPool> {
@@ -443,4 +456,112 @@ async fn engine_mode_blocked_device_declines() {
         .await
         .unwrap();
     assert_eq!(revoked.status().as_u16(), 204, "engine blocklist revoke");
+}
+
+/// Tier 2 — engine mode: a retried rail movement must NOT reach the engine again.
+///
+/// The four rail handlers used to screen *before* their idempotency replay, so a
+/// bank retry of an already-posted AFT/Interac/Lynx movement re-invoked the
+/// engine: velocity counted twice, a second decision row per retry, and above
+/// `fail_closed_above` a 503 for a request that had already succeeded
+/// (`design/INTEGRATION_DESIGN.md` §5 requires the replay to short-circuit
+/// first). The ordering is invisible on inspection — two adjacent blocks — so it
+/// gets a test rather than a comment.
+///
+/// Uses the AFT credit rail deliberately: originating accrues into the open batch
+/// and moves no money until settlement, so the assertion needs no funded account
+/// and runs where the funded-flow tests skip.
+#[tokio::test]
+async fn engine_mode_retried_rail_send_is_not_rescreened() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, &format!("rail-dev-{}", Uuid::new_v4())).await;
+    let from = create_account(&c, &token).await;
+
+    // A FRESH counterparty per run, not a fixed one: the engine tracks payee-side
+    // velocity, so a hardcoded account accumulates inbound attempts across runs
+    // until `payee_inbound_24h_high` joins the novelty codes and the engine starts
+    // holding the originate — a self-poisoning test.
+    let counterparty_account = format!("{:07}", Uuid::new_v4().as_u128() % 10_000_000);
+    let key = format!("rail-idem-{}", Uuid::new_v4());
+    let body = json!({
+        "originator_account_id": from,
+        "counterparty_institution": "003",
+        "counterparty_transit": "12345",
+        "counterparty_account": counterparty_account,
+        "payee_name": "Utility Co",
+        "amount": 40.0,
+        "idempotency_key": key,
+    });
+    let originate = |b: serde_json::Value| {
+        let c = c.clone();
+        let token = token.clone();
+        async move {
+            c.post(format!("{}/api/v1/aft/credits", base_url()))
+                .bearer_auth(&token)
+                .json(&b)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let first = originate(body.clone()).await;
+    assert_eq!(first.status().as_u16(), 201, "first originate");
+    let first_id = first.json::<Value>().await.unwrap()["entry_id"].clone();
+
+    let replay = originate(body).await;
+    assert_eq!(replay.status().as_u16(), 201, "replay returns the original");
+    assert_eq!(
+        replay.json::<Value>().await.unwrap()["entry_id"],
+        first_id,
+        "replay must be the same entry, not a second one"
+    );
+
+    // Counting decision ROWS cannot detect this: the engine is idempotent on the
+    // same key, so a re-screened retry replays the stored decision instead of
+    // inserting another. What it cannot undo is the velocity it already counted —
+    // the engine records every assessed attempt before it notices the replay.
+    //
+    // So drive one further originate under a fresh key and read the velocity the
+    // engine saw for this customer. Exactly one prior attempt means the retry
+    // never reached it; two means it did.
+    let probe_key = format!("rail-probe-{}", Uuid::new_v4());
+    let probe = originate(json!({
+        "originator_account_id": from,
+        "counterparty_institution": "003",
+        "counterparty_transit": "12345",
+        "counterparty_account": counterparty_account,
+        "payee_name": "Utility Co",
+        "amount": 41.0,
+        "idempotency_key": probe_key,
+    }))
+    .await;
+    assert_eq!(probe.status().as_u16(), 201, "probe originate");
+
+    if let Some(db) = engine_db().await {
+        let vector: Value = sqlx::query_scalar(
+            "SELECT feature_vector FROM decisions WHERE idempotency_key LIKE $1",
+        )
+        .bind(format!("%{probe_key}"))
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        let counts: Vec<(String, i64)> = vector
+            .as_object()
+            .expect("feature vector object")
+            .iter()
+            .filter(|(k, _)| k.starts_with("velocity:customer_id:"))
+            .map(|(k, v)| (k.clone(), v["count"].as_i64().unwrap_or(-1)))
+            .collect();
+        assert!(!counts.is_empty(), "no customer velocity in {vector}");
+        for (key, count) in &counts {
+            assert_eq!(
+                *count, 1,
+                "the engine should have seen ONE prior originate, not {count} ({key}) — \
+                 a retry was re-screened and double-counted velocity"
+            );
+        }
+    }
 }
