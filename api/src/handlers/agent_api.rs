@@ -256,6 +256,13 @@ pub(crate) fn transfer_failure_reason(err: &AppError) -> String {
         AppError::BadRequest(_) => "BAD_REQUEST".to_string(),
         AppError::NotFound(_) => "NOT_FOUND".to_string(),
         AppError::TransactionLimitExceeded => "ACCOUNT_LIMIT_EXCEEDED".to_string(),
+        // Fraud-engine refusals. Without these arms they audited as INTERNAL,
+        // which told the owner nothing — and, next to the gate's own row, told it
+        // twice and inconsistently. The engine's reason codes still never leave
+        // the engine; these are the bank's own coarse categories.
+        AppError::TransactionDeclined => "RISK_DECLINED".to_string(),
+        AppError::TransactionUnderReview(_) => "RISK_REVIEW".to_string(),
+        AppError::ServiceUnavailable(_) => "RISK_UNAVAILABLE".to_string(),
         _ => "INTERNAL".to_string(),
     }
 }

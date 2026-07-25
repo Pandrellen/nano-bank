@@ -1,9 +1,13 @@
 //! The shared screening gate every money-movement handler calls BEFORE its
 //! database transaction opens. Owns: operation-id minting, session-context
-//! recovery, the decision→error mapping, the fail-open/fail-closed matrix,
-//! and the agent-plane decline audit. Callers get back a [`FraudLink`] to
-//! stamp into their money row's metadata — or an `AppError` that aborts the
-//! movement before any DB write.
+//! recovery, the decision→error mapping, and the fail-open/fail-closed matrix.
+//! Callers get back a [`FraudLink`] to stamp into their money row's metadata —
+//! or an `AppError` that aborts the movement before any DB write.
+//!
+//! Auditing a refusal is the caller's job, not the gate's: the agent plane
+//! already records every failed transfer with its reason code, and a second
+//! writer here produced two contradictory `agent_actions` rows. Any future
+//! agent-reachable money path must keep that catch-all.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -11,7 +15,6 @@ use uuid::Uuid;
 
 use crate::errors::AppError;
 use crate::handlers::AppState;
-use crate::policy;
 
 use super::{FraudAction, FraudAgentCtx, FraudCheckError, FraudRequest, FraudSessionCtx};
 
@@ -120,29 +123,6 @@ async fn session_context(state: &AppState, session_id: Option<Uuid>) -> Option<F
     )
 }
 
-/// Audit an engine decline on the agent plane into `agent_actions`, same
-/// append-only precedent as policy denials. The reason is deliberately opaque:
-/// the agent (and the gateway that echoes reasons) must never learn why.
-async fn audit_agent_decline(state: &AppState, input: &ScreenInput<'_>, reason: &str) {
-    let Some(agent) = &input.agent else { return };
-    let result = policy::record_action(
-        &state.pool,
-        agent.mandate_id,
-        agent.agent_id,
-        input.customer_id,
-        input.from_account_id,
-        input.kind,
-        Some(input.amount),
-        "denied",
-        Some(reason),
-        None,
-    )
-    .await;
-    if let Err(e) = result {
-        tracing::error!(error = %e, "agent_actions audit for fraud decline failed");
-    }
-}
-
 pub(crate) async fn screen(
     state: &AppState,
     input: ScreenInput<'_>,
@@ -196,20 +176,20 @@ pub(crate) async fn screen(
                     failed_open: false,
                     screened: true,
                 }),
-                FraudAction::Block => {
-                    audit_agent_decline(state, &input, "RISK_DECLINED").await;
-                    Err(AppError::TransactionDeclined)
-                }
+                // The agent-plane audit for these is written by the caller's
+                // catch-all (handlers/agent_api.rs), which records EVERY failed
+                // agent transfer with its reason code. Auditing here as well wrote
+                // a second, contradictory row.
+                FraudAction::Block => Err(AppError::TransactionDeclined),
                 // hold_review today; challenge/delay_and_warn collapse here until
                 // the bank grows a challenge UX (integration phase 2).
                 FraudAction::HoldReview | FraudAction::Challenge | FraudAction::DelayAndWarn => {
-                    audit_agent_decline(state, &input, "RISK_REVIEW").await;
                     Err(AppError::TransactionUnderReview(
-                    decision.message_for_customer.unwrap_or_else(|| {
-                        "This transaction requires additional review before it can be completed."
-                            .to_string()
-                    }),
-                ))
+                        decision.message_for_customer.unwrap_or_else(|| {
+                            "This transaction requires additional review before it can be completed."
+                                .to_string()
+                        }),
+                    ))
                 }
             }
         }

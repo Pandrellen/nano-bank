@@ -182,6 +182,107 @@ async fn transfer(
         .unwrap()
 }
 
+async fn register_agent(c: &reqwest::Client) -> (Uuid, String) {
+    let v: Value = c
+        .post(format!("{}/api/v1/agents", base_url()))
+        .json(&json!({"display_name": "Fraud Port Agent", "description": "fraud_port e2e"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        Uuid::parse_str(v["agent_id"].as_str().unwrap()).unwrap(),
+        v["agent_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+async fn mandated_agent_token(
+    c: &reqwest::Client,
+    token: &str,
+    account: Uuid,
+) -> (Uuid, String) {
+    let (agent_id, secret) = register_agent(c).await;
+    let granted: Value = c
+        .post(format!("{}/api/v1/mandates", base_url()))
+        .bearer_auth(token)
+        .json(&json!({
+            "agent_id": agent_id,
+            "account_id": account,
+            "scopes": ["transfer:initiate"],
+            // Caps are mandatory with transfer:initiate; both sit above the test
+            // amount so the refusal comes from the engine, not the step-up path.
+            "max_per_tx": 100,
+            "daily_cap": 500,
+            "expires_at": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mandate = Uuid::parse_str(granted["mandate_id"].as_str().unwrap()).unwrap();
+    let issued: Value = c
+        .post(format!("{}/api/v1/auth/agent-token", base_url()))
+        .json(&json!({"agent_id": agent_id, "agent_secret": secret, "mandate_id": mandate}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (mandate, issued["access_token"].as_str().unwrap().to_string())
+}
+
+async fn agent_transfer(
+    c: &reqwest::Client,
+    atoken: &str,
+    to: Uuid,
+    amount: f64,
+) -> reqwest::Response {
+    c.post(format!("{}/api/v1/agent/transfers", base_url()))
+        .bearer_auth(atoken)
+        .json(&json!({
+            "to_account_id": to,
+            "amount": amount,
+            "description": "agent payment",
+            "idempotency_key": Uuid::new_v4().to_string(),
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn engine_list_add(c: &reqwest::Client, list: &str, key: &str) -> Value {
+    let created = c
+        .post(format!("{}/admin/v1/lists", engine_url()))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .json(&json!({"list_name": list, "entry_key": key, "reason": "fraud_port e2e test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status().as_u16(), 201, "engine list add");
+    created.json().await.unwrap()
+}
+
+async fn engine_list_revoke(c: &reqwest::Client, entry: &Value) {
+    let revoked = c
+        .delete(format!(
+            "{}/admin/v1/lists/{}",
+            engine_url(),
+            entry["entry_id"].as_str().unwrap()
+        ))
+        .bearer_auth(admin_token())
+        .header("X-Actor", "fraud-port-e2e")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked.status().as_u16(), 204, "engine list revoke");
+}
+
 async fn test_db() -> Option<sqlx::PgPool> {
     let url = std::env::var("NANO_BANK_TEST_DB_URL").unwrap_or_else(|_| {
         "postgres://nanobank_user:secure_nano_password_2024!@[::1]:5432/nano_bank_db".to_string()
@@ -244,6 +345,51 @@ async fn engine_mode_stamps_decision_linkage() {
         decision_id.is_some(),
         "fraud.decision_id stamped (engine round trip)"
     );
+}
+
+/// Tier 2 — engine mode: an engine refusal on the AGENT plane leaves exactly one
+/// audit row, carrying the risk reason.
+///
+/// Regression guard. The gate used to audit the decline itself while the agent
+/// handler's catch-all audited every failure too, so the owner's activity view
+/// showed the real `RISK_REVIEW` beside a contradictory `denied / INTERNAL` — the
+/// catch-all had no arm for the fraud errors. One writer, one row, right reason.
+#[tokio::test]
+async fn engine_mode_agent_refusal_audits_once() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, &format!("agent-dev-{}", Uuid::new_v4())).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+
+    // The engine watches the destination, so any payment to it is held. No funding
+    // needed: screening happens before the money transaction opens.
+    let entry = engine_list_add(&c, "account_watch", &to.to_string()).await;
+    let (mandate, atoken) = mandated_agent_token(&c, &token, from).await;
+
+    let resp = agent_transfer(&c, &atoken, to, 40.0).await;
+    assert_eq!(resp.status().as_u16(), 403, "watched destination must 403");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["code"], "TRANSACTION_UNDER_REVIEW");
+
+    if let Some(db) = test_db().await {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT decision, reason FROM agent_actions \
+             WHERE mandate_id = $1 AND operation = 'transfer' ORDER BY created_at",
+        )
+        .bind(mandate)
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("denied".to_string(), Some("RISK_REVIEW".to_string()))],
+            "exactly one audit row, with the risk reason"
+        );
+    }
+    engine_list_revoke(&c, &entry).await;
 }
 
 /// Tier 2 — engine mode: a device the fraud engine blocklists makes the bank
