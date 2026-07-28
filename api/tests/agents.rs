@@ -1950,3 +1950,243 @@ async fn unanswered_step_up_expiry_is_audited() {
     .unwrap();
     assert_eq!(rows, 1, "expiry audited once, not on every read");
 }
+
+/// The review's finding, directly: an expiry driven ONLY by the agent's poll.
+/// This is deliberately not covered by `expired_ask_is_not_actionable`, which
+/// calls the customer surface first and so lets the customer plane do the
+/// expiring. Before the fix the agent plane had its own inline UPDATE with no
+/// audit, so this expired the ask and left zero audit rows — permanently, since
+/// the customer sweep's `status = 'pending'` guard could never re-find it.
+#[tokio::test]
+async fn agent_poll_expiry_is_audited() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    let ask = park(&c, &atoken, b, 250.0, &format!("agent-expiry-{}", Uuid::new_v4())).await;
+    let approval_id = ask["approval_id"].as_str().unwrap().to_string();
+    age_out(&db, &approval_id).await;
+
+    // The agent's own poll is the only thing that touches this ask.
+    let resp = poll_approval(&c, &atoken, &approval_id).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "expired", "poll reports the terminal state");
+    assert_eq!(db_status(&db, &approval_id).await, "expired");
+    assert_eq!(
+        expiry_audits(&db, mandate).await,
+        1,
+        "an expiry the agent plane triggered must still be audited"
+    );
+
+    // Idempotent: polling again must not audit the same expiry twice.
+    let _ = poll_approval(&c, &atoken, &approval_id).await;
+    assert_eq!(
+        expiry_audits(&db, mandate).await,
+        1,
+        "expiry audited once, not on every poll"
+    );
+}
+
+/// The agent-plane expiry UPDATE used to be keyed on `approval_id` alone, unlike
+/// the SELECT beneath it — so any authenticated agent holding an approval_id
+/// could flip another mandate's ask to `expired`, unaudited, and strand it
+/// beyond the reach of the customer sweep. The write is now mandate-scoped.
+#[tokio::test]
+async fn agent_poll_cannot_expire_another_mandates_ask() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    let ask = park(&c, &atoken, b, 250.0, &format!("cross-expiry-{}", Uuid::new_v4())).await;
+    let approval_id = ask["approval_id"].as_str().unwrap().to_string();
+    age_out(&db, &approval_id).await;
+
+    // A second mandate for the same customer — same grantor, different ask scope.
+    let other_account = create_account(&c, &token, "savings").await;
+    let other_mandate = grant_mandate(&c, &token, agent_id, other_account, &["read:balance"]).await;
+    let other_atoken = agent_token(&c, agent_id, &secret, other_mandate).await;
+
+    let resp = poll_approval(&c, &other_atoken, &approval_id).await;
+    assert_eq!(resp.status().as_u16(), 404, "foreign ask stays invisible");
+
+    // Asserted before anything else touches the row: the foreign poll must not
+    // have written to it at all.
+    assert_eq!(
+        db_status(&db, &approval_id).await,
+        "pending",
+        "a foreign poll must not expire someone else's ask"
+    );
+    assert_eq!(expiry_audits(&db, mandate).await, 0);
+
+    // The owning mandate still expires it, audited.
+    let resp = poll_approval(&c, &atoken, &approval_id).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(db_status(&db, &approval_id).await, "expired");
+    assert_eq!(expiry_audits(&db, mandate).await, 1);
+}
+
+/// The existing expiry test sweeps exactly one row, so it never exercises the
+/// audit loop. Multi-row is where a mid-loop failure used to strand the rest.
+#[tokio::test]
+async fn every_expired_ask_in_one_sweep_is_audited() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 5000.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // Three open asks: a cap denial reserves nothing, so they coexist.
+    for _ in 0..3 {
+        let ask = park(&c, &atoken, b, 250.0, &format!("sweep-{}", Uuid::new_v4())).await;
+        age_out(&db, ask["approval_id"].as_str().unwrap()).await;
+    }
+
+    let listed = c
+        .get(format!("{}/api/v1/approvals", base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.status().is_success());
+
+    let expired: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pending_approvals WHERE mandate_id = $1 AND status = 'expired'",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(expired, 3);
+    assert_eq!(
+        expiry_audits(&db, mandate).await,
+        3,
+        "every row in the sweep is audited, not just the first"
+    );
+}
+
+/// The atomicity proof. A mid-transaction failure is unreachable from the HTTP
+/// surface, so the failure is injected from the test's own DB session: a trigger
+/// that refuses exactly this mandate's expiry audit. The payoff is the last
+/// step — after the trigger is gone the ask is still `pending`, so the retry
+/// re-finds it. Before the fix the flip had already committed and the guard
+/// `status = 'pending'` made the row permanently unauditable.
+#[tokio::test]
+async fn expiry_that_cannot_be_audited_does_not_expire() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    let ask = park(&c, &atoken, b, 250.0, &format!("atomic-{}", Uuid::new_v4())).await;
+    let approval_id = ask["approval_id"].as_str().unwrap().to_string();
+    age_out(&db, &approval_id).await;
+
+    // Scoped by mandate_id so concurrently running tests are unaffected.
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION nb_test_block_expiry_audit() RETURNS trigger \
+         AS $$ BEGIN RAISE EXCEPTION 'injected audit failure'; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_expiry_audit_x ON agent_actions")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER nb_test_block_expiry_audit_x BEFORE INSERT ON agent_actions \
+         FOR EACH ROW WHEN (NEW.mandate_id = '{mandate}'::uuid \
+           AND NEW.reason = 'STEP_UP_EXPIRED') \
+         EXECUTE FUNCTION nb_test_block_expiry_audit()"
+    ))
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // Rust has no `finally`: capture everything, drop the trigger, THEN assert,
+    // so a failed assertion can't leave the trigger poisoning later runs.
+    let blocked_status = c
+        .get(format!("{}/api/v1/approvals", base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .as_u16();
+    let status_while_blocked = db_status(&db, &approval_id).await;
+
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_expiry_audit_x ON agent_actions")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(blocked_status, 500, "an unauditable expiry must fail loudly");
+    assert_eq!(
+        status_while_blocked, "pending",
+        "the flip must roll back with its audit — not commit alone"
+    );
+
+    // The retry can still find it, which is the whole point.
+    let listed = c
+        .get(format!("{}/api/v1/approvals", base_url()))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert!(listed.status().is_success());
+    assert_eq!(db_status(&db, &approval_id).await, "expired");
+    assert_eq!(expiry_audits(&db, mandate).await, 1);
+}
+
+/// Age an ask past its deadline — the window is minutes and the test can't wait.
+async fn age_out(db: &sqlx::PgPool, approval_id: &str) {
+    sqlx::query(
+        "UPDATE pending_approvals SET expires_at = now() - interval '1 minute' \
+         WHERE approval_id = $1::uuid",
+    )
+    .bind(approval_id)
+    .execute(db)
+    .await
+    .unwrap();
+}
+
+async fn db_status(db: &sqlx::PgPool, approval_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM pending_approvals WHERE approval_id = $1::uuid")
+        .bind(approval_id)
+        .fetch_one(db)
+        .await
+        .unwrap()
+}
+
+async fn expiry_audits(db: &sqlx::PgPool, mandate: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM agent_actions WHERE mandate_id = $1 \
+         AND operation = 'transfer' AND decision = 'denied' AND reason = 'STEP_UP_EXPIRED'",
+    )
+    .bind(mandate)
+    .fetch_one(db)
+    .await
+    .unwrap()
+}

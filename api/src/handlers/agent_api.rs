@@ -358,29 +358,21 @@ async fn get_approval_status(
     agent: AuthenticatedAgent,
     Path(approval_id): Path<Uuid>,
 ) -> Result<Json<AgentApprovalStatus>, AppError> {
-    // Lazy reclaim-then-expire, same idiom as the customer surface — the agent
-    // polling is the other liveness path (an abandoned claim must become
-    // actionable even if the customer never opens /app).
-    sqlx::query(
-        "UPDATE pending_approvals \
-         SET status = 'pending', claimed_at = NULL \
-         WHERE approval_id = $1 AND status = 'executing' AND transaction_id IS NULL \
-           AND claimed_at <= CURRENT_TIMESTAMP - $2 * INTERVAL '1 second'",
+    // Lazy reclaim-then-expire — the agent polling is the other liveness path
+    // (an abandoned claim must become actionable even if the customer never
+    // opens /app). Through the customer plane's helper, not a copy: this used
+    // to be two inline UPDATEs here, and the expiry one wrote no audit at all,
+    // so an agent that polled first destroyed the ask's ending. Scoped to the
+    // polling mandate too — this handler must not write a row it may not read.
+    crate::handlers::approvals::reclaim_and_expire(
+        &state.pool,
+        crate::handlers::approvals::ExpiryScope::Ask {
+            customer_id: agent.customer_id,
+            mandate_id: agent.mandate_id,
+            approval_id,
+        },
     )
-    .bind(approval_id)
-    .bind(crate::handlers::approvals::RECLAIM_AFTER_SECONDS)
-    .execute(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
-    sqlx::query(
-        "UPDATE pending_approvals \
-         SET status = 'expired', resolved_at = CURRENT_TIMESTAMP \
-         WHERE approval_id = $1 AND status = 'pending' AND expires_at <= CURRENT_TIMESTAMP",
-    )
-    .bind(approval_id)
-    .execute(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
+    .await?;
 
     let approval = sqlx::query_as::<_, AgentApprovalStatus>(&format!(
         "SELECT {AGENT_APPROVAL_COLUMNS} FROM pending_approvals \
