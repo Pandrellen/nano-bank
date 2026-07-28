@@ -30,6 +30,9 @@ pub const REASON_DAILY_CAP_EXCEEDED: &str = "DAILY_CAP_EXCEEDED";
 /// parked over-cap transfer, audited under the transfer operation.
 pub const REASON_STEP_UP_APPROVED: &str = "STEP_UP_APPROVED";
 pub const REASON_STEP_UP_DECLINED: &str = "STEP_UP_DECLINED";
+/// The third terminal outcome: the ask ran out of time unanswered. Without it an
+/// unanswered ask left `step_up_required` as its last word in the activity view.
+pub const REASON_STEP_UP_EXPIRED: &str = "STEP_UP_EXPIRED";
 
 /// Audit decision for a reason code: the two cap overruns are step-up
 /// candidates; everything else is a hard deny.

@@ -40,6 +40,15 @@ pub enum AppError {
     #[error("Rate limit exceeded: {0}")]
     RateLimit(String),
 
+    /// The agent plane's single refusal. Automated clients get this instead of the
+    /// specific cause: distinguishable refusals let a mandated agent classify
+    /// third-party accounts, enumerate its own payee allowlist, and bisect the
+    /// funding account's balance without holding `read:balance`. The real reason
+    /// is not lost — it goes to `agent_actions`, where the granting customer sees
+    /// it. See `handlers::agent_api::refusal_for_agent`.
+    #[error("Transfer refused")]
+    TransferRefused,
+
     #[error("Insufficient funds")]
     InsufficientFunds,
 
@@ -128,6 +137,12 @@ impl IntoResponse for AppError {
                 message.as_str(),
             ),
             AppError::RateLimit(msg) => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT", msg.as_str()),
+            // Fixed message: any variation is a signal to hill-climb on.
+            AppError::TransferRefused => (
+                StatusCode::FORBIDDEN,
+                "TRANSFER_REFUSED",
+                "This transfer cannot be completed. The account owner can see why.",
+            ),
             AppError::InsufficientFunds => (
                 StatusCode::BAD_REQUEST,
                 "INSUFFICIENT_FUNDS",

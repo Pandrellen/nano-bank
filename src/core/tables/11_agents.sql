@@ -23,8 +23,14 @@ CREATE TABLE agents (
     -- Global kill switch for a compromised agent (checked on every request).
     status       VARCHAR(20) NOT NULL DEFAULT 'active'
                  CHECK (status IN ('active', 'disabled')),
+    -- Source address of the registration. Registration is unauthenticated, so
+    -- this is what the per-address throttle counts (handlers/agents.rs), and it
+    -- is the provenance if a flood ever has to be traced.
+    registered_ip INET,
     created_at   TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX idx_agents_registered_ip ON agents (registered_ip, created_at)
+    WHERE registered_ip IS NOT NULL;
 
 -- The consent record — the single source of truth for what an agent may do.
 -- Scopes/limits deliberately do NOT live in the agent JWT.

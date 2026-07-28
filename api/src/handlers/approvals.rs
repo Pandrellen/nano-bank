@@ -61,38 +61,136 @@ const APPROVAL_FROM: &str = "FROM pending_approvals p \
 /// How long an `executing` claim may live before it is presumed dead and
 /// reclaimed. 3× the 30s request timeout: an execution still in flight can't
 /// outlive its request by that much.
-pub(crate) const RECLAIM_AFTER_SECONDS: i32 = 90;
+const RECLAIM_AFTER_SECONDS: i32 = 90;
+
+/// Which open asks a lazy sweep may touch.
+///
+/// Both planes run the *same* two statements and the same audit through
+/// [`reclaim_and_expire`] — only the scope differs. Keeping one implementation
+/// is the point: the agent plane once had its own inline expiry UPDATE with no
+/// audit at all, so which plane happened to touch a row first decided whether
+/// its ending was recorded.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpiryScope {
+    /// Customer plane: every open ask this owner has.
+    Owner { customer_id: Uuid },
+    /// Agent plane: exactly one ask, and only if the polling mandate owns it.
+    /// Without the mandate bind this is a cross-mandate write — an agent could
+    /// expire an ask it is not even allowed to read.
+    Ask {
+        customer_id: Uuid,
+        mandate_id: Uuid,
+        approval_id: Uuid,
+    },
+}
+
+impl ExpiryScope {
+    /// `(customer_id, approval_id, mandate_id)` — the last two are NULL on the
+    /// customer plane, where the sweep covers the whole owner's queue.
+    fn binds(self) -> (Uuid, Option<Uuid>, Option<Uuid>) {
+        match self {
+            ExpiryScope::Owner { customer_id } => (customer_id, None, None),
+            ExpiryScope::Ask {
+                customer_id,
+                mandate_id,
+                approval_id,
+            } => (customer_id, Some(approval_id), Some(mandate_id)),
+        }
+    }
+}
+
+/// The scope predicate both sweep statements share. `customer_id` is always
+/// bound — it keeps the customer index usable and makes a cross-owner sweep
+/// unrepresentable; the other two only narrow. Same NULL-tolerant idiom as the
+/// status filter in [`list_approvals`].
+const SWEEP_SCOPE: &str = "customer_id = $1 \
+     AND ($2::uuid IS NULL OR approval_id = $2) \
+     AND ($3::uuid IS NULL OR mandate_id = $3)";
+
+/// One expired ask's audit ingredients. A named struct rather than a tuple:
+/// five consecutive `Uuid`s decoded positionally is a bug waiting to happen.
+#[derive(sqlx::FromRow)]
+struct ExpiredAsk {
+    approval_id: Uuid,
+    mandate_id: Uuid,
+    agent_id: Uuid,
+    customer_id: Uuid,
+    account_id: Uuid,
+    amount: Decimal,
+}
 
 /// Reclaim-then-expire, called before every read/resolve so nobody ever acts
 /// on a stale row (no sweeper needed): first revert dead `executing` claims
 /// (crashed executor — the lease timed out) back to `pending`, then flip
 /// overdue open asks to `expired`. Order matters: a reclaimed row already past
 /// its `expires_at` correctly cascades to expired in the second statement.
-async fn expire_overdue(
+///
+/// **All of it commits as one transaction.** Expiry is a terminal outcome for
+/// the agent's ask, so it is audited like the other two — and the expiry
+/// predicate is `status = 'pending'`, so a row that reached `expired` without
+/// its audit row could never be re-found. Flipping first and auditing after
+/// (which is what this used to do, on the pool under autocommit) makes a
+/// mid-loop failure permanently unauditable. The reclaim rides along so the
+/// cascade above is a structural invariant rather than an incidental one.
+pub(crate) async fn reclaim_and_expire(
     pool: &crate::config::database::DatabasePool,
-    customer_id: Uuid,
+    scope: ExpiryScope,
 ) -> Result<(), AppError> {
-    sqlx::query(
+    let (customer_id, approval_id, mandate_id) = scope.binds();
+    let mut tx = pool.begin().await.map_err(AppError::Database)?;
+
+    // Deliberately unaudited: a lease timeout restores the prior state, it is
+    // not a decision about the agent's ask.
+    sqlx::query(&format!(
         "UPDATE pending_approvals \
          SET status = 'pending', claimed_at = NULL \
-         WHERE customer_id = $1 AND status = 'executing' AND transaction_id IS NULL \
-           AND claimed_at <= CURRENT_TIMESTAMP - $2 * INTERVAL '1 second'",
-    )
+         WHERE {SWEEP_SCOPE} AND status = 'executing' AND transaction_id IS NULL \
+           AND claimed_at <= CURRENT_TIMESTAMP - $4 * INTERVAL '1 second'"
+    ))
     .bind(customer_id)
+    .bind(approval_id)
+    .bind(mandate_id)
     .bind(RECLAIM_AFTER_SECONDS)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(AppError::Database)?;
-    sqlx::query(
+
+    let expired: Vec<ExpiredAsk> = sqlx::query_as(&format!(
         "UPDATE pending_approvals \
          SET status = 'expired', resolved_at = CURRENT_TIMESTAMP \
-         WHERE customer_id = $1 AND status = 'pending' \
-           AND expires_at <= CURRENT_TIMESTAMP",
-    )
+         WHERE {SWEEP_SCOPE} AND status = 'pending' \
+           AND expires_at <= CURRENT_TIMESTAMP \
+         RETURNING approval_id, mandate_id, agent_id, customer_id, account_id, amount"
+    ))
     .bind(customer_id)
-    .execute(pool)
+    .bind(approval_id)
+    .bind(mandate_id)
+    .fetch_all(&mut *tx)
     .await
     .map_err(AppError::Database)?;
+
+    for ask in &expired {
+        policy::record_action_tx(
+            &mut tx,
+            ask.mandate_id,
+            ask.agent_id,
+            ask.customer_id,
+            ask.account_id,
+            "transfer",
+            Some(ask.amount),
+            "denied",
+            Some(policy::REASON_STEP_UP_EXPIRED),
+            None,
+        )
+        .await
+        .map_err(AppError::Database)?;
+    }
+    tx.commit().await.map_err(AppError::Database)?;
+
+    // After the commit: logging an expiry that then rolled back would be a lie.
+    for ask in &expired {
+        tracing::info!(approval_id = %ask.approval_id, "step-up ask expired unanswered");
+    }
     Ok(())
 }
 
@@ -108,7 +206,13 @@ async fn list_approvals(
     auth: AuthenticatedCustomer,
     Query(q): Query<ApprovalListQuery>,
 ) -> Result<Json<Vec<PendingApprovalResponse>>, AppError> {
-    expire_overdue(&state.pool, auth.customer_id).await?;
+    reclaim_and_expire(
+        &state.pool,
+        ExpiryScope::Owner {
+            customer_id: auth.customer_id,
+        },
+    )
+    .await?;
 
     let approvals = sqlx::query_as::<_, PendingApprovalResponse>(&format!(
         "SELECT {APPROVAL_COLUMNS} {APPROVAL_FROM} \
@@ -151,6 +255,12 @@ async fn finalize_approved(
     customer_id: Uuid,
     resp: &TransactionResponse,
 ) -> Result<(), AppError> {
+    // One transaction: `approved` is terminal, so a flip whose audit then failed
+    // would be unrecoverable. Rolling back instead leaves the row `executing`
+    // with transaction_id IS NULL — the already-handled stranded state, which
+    // the reclaim ages back to `pending` and re-approve adopts by idempotency
+    // key. Atomicity turns an unrecoverable outcome into a recoverable one.
+    let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
     let updated = sqlx::query(
         "UPDATE pending_approvals \
          SET status = 'approved', transaction_id = $2, \
@@ -159,18 +269,21 @@ async fn finalize_approved(
     )
     .bind(approval_id)
     .bind(resp.transaction_id)
-    .execute(&state.pool)
+    .execute(&mut *tx)
     .await
     .map_err(AppError::Database)?;
 
     if updated.rows_affected() != 1 {
+        // Explicit rollback, not drop-rollback: this is a *success* return, and
+        // a reader should not have to reason about Drop to see nothing was kept.
+        tx.rollback().await.map_err(AppError::Database)?;
         tracing::warn!(approval_id = %approval_id, transaction_id = %resp.transaction_id,
             "step-up finalize lost its claim (reclaimed mid-execution) — money moved, \
              state owned by the other resolution");
         return Ok(());
     }
-    policy::record_action(
-        &state.pool,
+    policy::record_action_tx(
+        &mut tx,
         claim.mandate_id,
         claim.agent_id,
         customer_id,
@@ -183,6 +296,7 @@ async fn finalize_approved(
     )
     .await
     .map_err(AppError::Database)?;
+    tx.commit().await.map_err(AppError::Database)?;
     tracing::info!(approval_id = %approval_id, transaction_id = %resp.transaction_id,
         "✅ step-up approval executed");
     Ok(())
@@ -201,7 +315,13 @@ async fn approve_approval(
     auth: AuthenticatedCustomer,
     Path(approval_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<TransactionResponse>), AppError> {
-    expire_overdue(&state.pool, auth.customer_id).await?;
+    reclaim_and_expire(
+        &state.pool,
+        ExpiryScope::Owner {
+            customer_id: auth.customer_id,
+        },
+    )
+    .await?;
 
     // Guarded claim: only one approver wins; a lost race / resolved / already
     // in-flight row is a clean 409, someone else's approval is a 404 (no
@@ -299,19 +419,22 @@ async fn approve_approval(
             Ok((StatusCode::CREATED, Json(resp)))
         }
         Err(err) => {
-            // Revert the claim so the ask stays actionable (expiry still applies).
+            // Computed before begin() — keep the transaction to its two writes.
+            let reason = transfer_failure_reason(&err);
+            // Revert the claim so the ask stays actionable (expiry still
+            // applies), with the denial audit in the same commit.
+            let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
             sqlx::query(
                 "UPDATE pending_approvals \
                  SET status = 'pending', claimed_at = NULL \
                  WHERE approval_id = $1 AND status = 'executing' AND transaction_id IS NULL",
             )
             .bind(approval_id)
-            .execute(&state.pool)
+            .execute(&mut *tx)
             .await
             .map_err(AppError::Database)?;
-            let reason = transfer_failure_reason(&err);
-            policy::record_action(
-                &state.pool,
+            policy::record_action_tx(
+                &mut tx,
                 claim.mandate_id,
                 claim.agent_id,
                 auth.customer_id,
@@ -324,6 +447,7 @@ async fn approve_approval(
             )
             .await
             .map_err(AppError::Database)?;
+            tx.commit().await.map_err(AppError::Database)?;
             // A dead mandate is a 401 on the AGENT plane; here the customer's
             // credential is fine — the conflict is with the approval's state.
             Err(match err {
@@ -342,8 +466,17 @@ async fn decline_approval(
     auth: AuthenticatedCustomer,
     Path(approval_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    expire_overdue(&state.pool, auth.customer_id).await?;
+    reclaim_and_expire(
+        &state.pool,
+        ExpiryScope::Owner {
+            customer_id: auth.customer_id,
+        },
+    )
+    .await?;
 
+    // The flip and its denial audit commit together — `declined` is terminal and
+    // guarded on `status = 'pending'`, so an unaudited one could never be redone.
+    let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
     let declined = sqlx::query_as::<_, ClaimedApproval>(
         "UPDATE pending_approvals \
          SET status = 'declined', resolved_at = CURRENT_TIMESTAMP \
@@ -353,18 +486,21 @@ async fn decline_approval(
     )
     .bind(approval_id)
     .bind(auth.customer_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(AppError::Database)?;
 
     let Some(claim) = declined else {
+        // On the open transaction, not the pool: acquiring a second connection
+        // while holding one is a pool-exhaustion deadlock under load. Nothing
+        // was written, so the error return's drop-rollback is the right exit.
         let status: Option<String> = sqlx::query_scalar(
             "SELECT status FROM pending_approvals \
              WHERE approval_id = $1 AND customer_id = $2",
         )
         .bind(approval_id)
         .bind(auth.customer_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(AppError::Database)?;
         return match status.as_deref() {
@@ -374,8 +510,8 @@ async fn decline_approval(
         };
     };
 
-    policy::record_action(
-        &state.pool,
+    policy::record_action_tx(
+        &mut tx,
         claim.mandate_id,
         claim.agent_id,
         auth.customer_id,
@@ -388,6 +524,7 @@ async fn decline_approval(
     )
     .await
     .map_err(AppError::Database)?;
+    tx.commit().await.map_err(AppError::Database)?;
 
     tracing::info!(approval_id = %approval_id, "🚫 step-up approval declined");
     Ok(StatusCode::NO_CONTENT)

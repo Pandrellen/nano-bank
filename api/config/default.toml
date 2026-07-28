@@ -30,6 +30,12 @@ session_timeout = 86400
 require_mfa = false
 # Secret the mock Visa network presents to mint a service token (client-credentials).
 service_client_secret = "nano-bank-visa-network-secret-change-me"
+# Agent registration stays unauthenticated (a registered agent is inert until
+# mandated), so it is metered per source address instead. Calibrated to cap the
+# RATE of a flood — the pool-exhaustion risk — not to ration real use: an
+# integration run or a demo seed registers dozens from one address in seconds.
+max_agent_registrations = 60
+agent_registration_window = 60
 
 [logging]
 level = "info"
