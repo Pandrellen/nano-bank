@@ -2,6 +2,7 @@
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
 import { decodeJwtExpiry } from "@/lib/jwt";
 import { API_BASE_URL, TOKEN_MAX_AGE_SECONDS } from "@/lib/config";
 
@@ -149,6 +150,7 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
 
   const data: LoginResponseBody = await response.json();
   await setSessionCookies(data);
+  revalidatePath("/", "layout");
 
   return {
     success: true,
@@ -189,6 +191,7 @@ export async function refreshSessionAction(): Promise<RefreshResult> {
   if (!response.ok) {
     cookieStore.delete("access_token");
     cookieStore.delete("refresh_token");
+    revalidatePath("/", "layout");
     return { success: false };
   }
 
