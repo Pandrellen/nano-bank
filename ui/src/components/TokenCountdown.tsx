@@ -2,8 +2,27 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { refreshSessionAction } from "@/actions/auth";
+import { refreshSessionAction, type RefreshResult } from "@/actions/auth";
 import { REFRESH_LEAD_MS } from "@/lib/config";
+
+// Module-level, not per-instance: the refresh token is single-use, so two
+// concurrent refreshes (React StrictMode's dev double-mount, or more than one
+// TokenCountdown mounted at once) race to present it — the loser gets a 401
+// and its cookies wiped even though the session was fine. Sharing one
+// in-flight promise across all callers in this page's JS runtime collapses
+// concurrent calls into a single request. Same root cause as the multi-tab
+// issue in the README, just one scope narrower — a module-level promise
+// doesn't cover separate tabs, each of which gets its own JS runtime.
+let inFlightRefresh: Promise<RefreshResult> | null = null;
+
+function refreshSessionOnce(): Promise<RefreshResult> {
+  if (!inFlightRefresh) {
+    inFlightRefresh = refreshSessionAction().finally(() => {
+      inFlightRefresh = null;
+    });
+  }
+  return inFlightRefresh;
+}
 
 function formatRemaining(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -28,9 +47,9 @@ export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
         refreshInFlight.current = true;
         setIsRefreshing(true);
 
-        let result;
+        let result: RefreshResult;
         try {
-          result = await refreshSessionAction();
+          result = await refreshSessionOnce();
         } catch (error) {
           console.error("Token refresh failed:", error);
           result = { success: false as const };
