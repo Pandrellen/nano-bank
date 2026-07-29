@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { refreshSessionAction } from "@/actions/auth";
+import { sanitizeNextPath } from "@/lib/redirects";
 
 /** Silent token-refresh entry point for protected Server Components.
  *
@@ -10,9 +11,8 @@ import { refreshSessionAction } from "@/actions/auth";
  * cookies); otherwise — session truly over, or the refresh call failed — we send
  * the user to sign in. */
 export async function GET(request: NextRequest) {
-  const requested = request.nextUrl.searchParams.get("next") ?? "/dashboard";
   // Only allow same-origin relative paths as the redirect target (no open redirect).
-  const next = requested.startsWith("/") && !requested.startsWith("//") ? requested : "/dashboard";
+  const next = sanitizeNextPath(request.nextUrl.searchParams.get("next"));
 
   const result = await refreshSessionAction();
 
