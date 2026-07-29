@@ -177,6 +177,26 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
          WHERE status IN ('pending', 'executing')",
         "CREATE INDEX IF NOT EXISTS idx_pending_approvals_customer \
          ON pending_approvals(customer_id, created_at)",
+        // Denial telemetry outbox. Written in the SAME statement as the audit
+        // row it mirrors (the CTE in policy.rs), drained to the fraud engine by
+        // handlers/fraud_admin.rs. An outbox rather than a fire-and-forget POST
+        // because loss would correlate with load, and load is when probing
+        // happens — the signal would thin out exactly when it mattered.
+        r#"
+        CREATE TABLE IF NOT EXISTS agent_denial_outbox (
+            outbox_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            action_id       UUID NOT NULL REFERENCES agent_actions(action_id) ON DELETE CASCADE,
+            event_key       VARCHAR(255) NOT NULL UNIQUE,
+            payload         JSONB NOT NULL,
+            delivered       BOOLEAN NOT NULL DEFAULT FALSE,
+            delivery_attempts   INTEGER NOT NULL DEFAULT 0,
+            last_delivery_error TEXT,
+            delivered_at        TIMESTAMP WITH TIME ZONE,
+            created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_agent_denial_outbox_undelivered \
+         ON agent_denial_outbox (delivered, created_at) WHERE delivered = FALSE",
         // Migrate DBs whose CHECK predates the transient 'executing' claim
         // state ('approved' is only ever written together with transaction_id).
         // DROP + re-ADD each boot: the pair is idempotent, and the ADD tolerates

@@ -45,10 +45,51 @@ pub fn decision_for(reason: &str) -> &'static str {
 
 /// The one audit INSERT, shared by [`record_action`] and [`record_action_tx`]
 /// so the two executors can never drift on columns or bind order.
-const ACTION_INSERT_SQL: &str = "INSERT INTO agent_actions \
+///
+/// It is a CTE because every non-`allowed` decision must also land in
+/// `agent_denial_outbox` for the fraud engine, and the two writes have to be
+/// one unit. Doing it here rather than at the nine call sites buys three
+/// things at once:
+///
+/// * **Atomicity for free, on both executors.** Under `record_action`'s
+///   autocommit this is a single statement; inside `record_action_tx` it joins
+///   the caller's transaction. So an event is never published for a state
+///   change that rolled back — the dual-write problem, solved by construction
+///   rather than by everyone remembering.
+/// * **Coverage that cannot rot.** A denial site added next year is covered
+///   the day it is written, because it calls one of these two helpers.
+/// * **A stable idempotency key.** `event_key` derives from `action_id`, so a
+///   drainer redelivery is a no-op at the engine instead of a duplicate.
+///
+/// `decision <> 'allowed'` deliberately includes `step_up_required`: the cap
+/// overruns are exactly the balance/limit bisection worth seeing. The real
+/// decision travels in the payload so the engine can separate them later.
+const ACTION_INSERT_SQL: &str = "WITH a AS ( \
+     INSERT INTO agent_actions \
      (mandate_id, agent_id, customer_id, account_id, operation, amount, \
       decision, reason, transaction_id) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+     RETURNING action_id, mandate_id, agent_id, customer_id, account_id, \
+               operation, amount, decision, reason, created_at \
+   ) \
+   INSERT INTO agent_denial_outbox (action_id, event_key, payload) \
+   SELECT action_id, \
+          'agent-denial:' || action_id, \
+          jsonb_build_object( \
+              'event_key', 'agent-denial:' || action_id, \
+              'event_type', 'agent_denial', \
+              'source', 'bank_pep', \
+              'customer_id', customer_id, \
+              'occurred_at', created_at, \
+              'detail', jsonb_build_object( \
+                  'decision', decision, \
+                  'reason', reason, \
+                  'operation', operation, \
+                  'amount', amount, \
+                  'mandate_id', mandate_id, \
+                  'agent_id', agent_id)) \
+     FROM a \
+    WHERE decision <> 'allowed'";
 
 /// Append one decision to the `agent_actions` audit. Part of the request path
 /// by design: if the audit can't be written, the action doesn't happen.

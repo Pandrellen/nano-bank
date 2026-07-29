@@ -18,12 +18,21 @@ pub struct EngineFraudCheck {
     base_url: String,
     token: String,
     http: reqwest::Client,
+    /// Background telemetry gets its own client. `http` carries the synchronous
+    /// decision budget (150ms by default) which is the caller's latency
+    /// envelope, not a sane deadline for an outbox drain.
+    telemetry_http: reqwest::Client,
     consecutive_failures: AtomicU32,
     open_until: Mutex<Option<Instant>>,
 }
 
 impl EngineFraudCheck {
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>, timeout_ms: u64) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        timeout_ms: u64,
+        outcomes_timeout_ms: u64,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             token: token.into(),
@@ -32,6 +41,10 @@ impl EngineFraudCheck {
                 .connect_timeout(Duration::from_millis(timeout_ms.min(50)))
                 .build()
                 .expect("reqwest client"),
+            telemetry_http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(outcomes_timeout_ms))
+                .build()
+                .expect("reqwest telemetry client"),
             consecutive_failures: AtomicU32::new(0),
             open_until: Mutex::new(None),
         }
@@ -197,5 +210,58 @@ impl FraudCheck for EngineFraudCheck {
         if let Err(e) = result {
             tracing::warn!(operation_id = %req.operation_id, error = %e, "fraud rescore not delivered");
         }
+    }
+
+    /// Deliver one denial from the outbox. Unlike `rescore` above, this reports
+    /// its outcome honestly rather than swallowing it: the drainer marks the
+    /// row delivered only on success, and a row wrongly marked delivered is
+    /// lost for good.
+    ///
+    /// It also does two things `rescore` does not, deliberately: it checks the
+    /// response status (a 500 or a 401 is a failure, not a delivery), and it
+    /// participates in the circuit breaker, so a dead engine stops a batch of
+    /// 100 from each burning a full timeout.
+    async fn report_denial(&self, payload: &serde_json::Value) -> Result<(), FraudCheckError> {
+        if self.circuit_open() {
+            return Err(FraudCheckError::Transport("circuit open".to_string()));
+        }
+        let resp = self
+            .telemetry_http
+            .post(format!("{}/v1/outcomes", self.base_url))
+            .bearer_auth(&self.token)
+            .json(payload)
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() => {
+                self.record_failure();
+                return Err(FraudCheckError::Timeout);
+            }
+            Err(e) => {
+                self.record_failure();
+                return Err(FraudCheckError::Transport(e.to_string()));
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            self.record_success();
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_server_error() {
+            self.record_failure();
+            return Err(FraudCheckError::Transport(format!(
+                "engine {status}: {body}"
+            )));
+        }
+        // 4xx is a bank-side contract bug (a malformed payload, a stale token),
+        // not an engine outage — same reasoning as `assess`. Do not trip the
+        // breaker, but do fail the row so it retries into its dead-letter cap
+        // rather than being marked delivered.
+        Err(FraudCheckError::Backend {
+            status: status.as_u16(),
+            body,
+        })
     }
 }

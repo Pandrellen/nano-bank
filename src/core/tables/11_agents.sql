@@ -135,3 +135,33 @@ CREATE UNIQUE INDEX idx_pending_approvals_open_ask
     ON pending_approvals(mandate_id, idempotency_key)
     WHERE status IN ('pending', 'executing');
 CREATE INDEX idx_pending_approvals_customer ON pending_approvals(customer_id, created_at);
+
+-- Denial telemetry outbox: every agent_actions row that is NOT 'allowed' is
+-- mirrored here in the SAME statement that writes the audit (see the CTE in
+-- api/src/policy.rs), then drained to the fraud engine's POST /v1/outcomes by
+-- handlers/fraud_admin.rs::flush_denials.
+--
+-- Why an outbox and not a fire-and-forget POST: you cannot atomically write
+-- this database AND call a remote service. Fire-and-forget loses events under
+-- load, and load is exactly when enumeration probing happens — the loss would
+-- correlate with the attack it is meant to reveal. The audit row and its
+-- telemetry row therefore commit or roll back together, always.
+--
+-- event_key is the engine's idempotency key, derived from action_id so a
+-- redelivery is a no-op there (ON CONFLICT DO NOTHING) rather than a duplicate.
+CREATE TABLE agent_denial_outbox (
+    outbox_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    action_id       UUID NOT NULL REFERENCES agent_actions(action_id) ON DELETE CASCADE,
+    event_key       VARCHAR(255) NOT NULL UNIQUE,
+    payload         JSONB NOT NULL,
+    delivered       BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Drainer bookkeeping, same shape as interac_notifications: the retry
+    -- budget caps a permanently-failing send (dead-letter, not an infinite
+    -- loop), last_delivery_error is for observability.
+    delivery_attempts   INTEGER NOT NULL DEFAULT 0,
+    last_delivery_error TEXT,
+    delivered_at        TIMESTAMP WITH TIME ZONE,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX idx_agent_denial_outbox_undelivered
+    ON agent_denial_outbox (delivered, created_at) WHERE delivered = FALSE;
