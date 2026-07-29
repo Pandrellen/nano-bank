@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { Suspense } from "react";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "sonner";
@@ -42,18 +43,15 @@ export default function RootLayout({
             <div className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] rounded-full bg-nanobank-orange-deep/10 blur-[120px]"></div>
           </div>
 
-          <Header />
+          <Suspense fallback={null}>
+            <Header />
+          </Suspense>
 
           {children}
 
-          <Footer
-            links={[
-              { label: "Privacy Policy", href: "/privacy" },
-              { label: "Terms of Service", href: "/terms" },
-            ]}
-          />
+          <Footer />
 
-          <Toaster position="top-right" richColors />
+          <Toaster position="top-center" richColors />
         </div>
       </body>
     </html>

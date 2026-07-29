@@ -65,3 +65,5 @@ npm run dev
 2. Zero tests in "ui" currently. Look to add some Playwright tests for the golden path (sign up → sign in → dashboard shows countdown → logout) would be valuable at a later stage.
 
 3. lucide-react is added but not currently used, there is intention to use it imminently.
+
+4. Learn More on the main page is a dead link at present.
