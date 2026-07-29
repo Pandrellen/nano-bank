@@ -6,6 +6,23 @@ echo "🏦 Deploying Nano Bank PostgreSQL to Kubernetes..."
 # Ensure we're in the right directory
 cd "$(dirname "$0")"
 
+# Ensure cluster A exists AND publishes host port 3000 (needed for the UI).
+# kind fixes port mappings at creation time, so a cluster made before the UI
+# mapping was added must be recreated (Postgres data is wiped; the init-db job
+# below re-creates the schema).
+if kind get clusters 2>/dev/null | grep -qx "nano-bank"; then
+  if ! docker port nano-bank-control-plane 2>/dev/null | grep -q ':3000'; then
+    echo "⚠️  Existing 'nano-bank' cluster lacks the UI port 3000 mapping."
+    echo "    Recreating it — Postgres data will be wiped and the schema re-initialised."
+    kind delete cluster --name nano-bank
+    kind create cluster --config kind-cluster-config.yaml
+  fi
+else
+  echo "📦 Creating 'nano-bank' cluster..."
+  kind create cluster --config kind-cluster-config.yaml
+fi
+kubectl config use-context kind-nano-bank >/dev/null
+
 # Check if kubectl is available
 if ! command -v kubectl &> /dev/null; then
     echo "❌ kubectl not found in PATH"
@@ -77,6 +94,14 @@ echo "🏦 Deploying bank-api..."
 kubectl apply -f bank-api-deployment.yaml
 kubectl -n nano-bank rollout status deploy/bank-api --timeout=180s
 
+echo "🐳 Building + loading nano-bank-ui image..."
+docker build -t nano-bank-ui:dev ../ui
+kind load docker-image nano-bank-ui:dev --name nano-bank
+
+echo "🖥️  Deploying nano-bank-ui..."
+kubectl apply -f ui-deployment.yaml
+kubectl -n nano-bank rollout status deploy/nano-bank-ui --timeout=180s
+
 echo "🎉 Nano Bank PostgreSQL deployment complete!"
 echo ""
 echo "📊 Connection Details:"
@@ -88,6 +113,8 @@ echo "  Password: secure_nano_password_2024!"
 echo ""
 echo "🔗 Connect with:"
 echo "  psql -h localhost -p 30432 -U nanobank_user -d nano_bank_db"
+echo ""
+echo "  UI:                http://localhost:3000"
 echo ""
 echo "📈 Useful Commands:"
 echo "  kubectl get pods -n nano-bank"
