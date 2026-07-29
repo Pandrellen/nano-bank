@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { signInAction } from "@/actions/auth";
 
+const MIN_PASSWORD_LENGTH = 8;
+
 export default function SigninForm() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
@@ -63,6 +65,8 @@ export default function SigninForm() {
             name="password"
             type={showPassword ? "text" : "password"}
             required
+            minLength={MIN_PASSWORD_LENGTH}
+            title={`Password must be at least ${MIN_PASSWORD_LENGTH} characters`}
             placeholder="••••••••"
             autoComplete="current-password"
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500 pr-10"

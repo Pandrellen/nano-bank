@@ -5,6 +5,14 @@ import { useRouter } from "next/navigation";
 import { toast } from "sonner";
 import { signUpAction } from "@/actions/auth";
 
+const MIN_PASSWORD_LENGTH = 8;
+
+function maxDateOfBirth(): string {
+  const today = new Date();
+  const eighteenYearsAgo = new Date(today.getFullYear() - 18, today.getMonth(), today.getDate());
+  return eighteenYearsAgo.toISOString().split("T")[0];
+}
+
 export default function SignupForm() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
@@ -110,6 +118,7 @@ export default function SignupForm() {
             name="dateOfBirth"
             type="date"
             required
+            max={maxDateOfBirth()}
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm text-slate-300 [color-scheme:dark]"
           />
         </div>
@@ -124,6 +133,10 @@ export default function SignupForm() {
               name="sin"
               type={showSin ? "text" : "password"}
               required
+              pattern="\d{9}"
+              maxLength={9}
+              inputMode="numeric"
+              title="SIN must be 9 digits"
               placeholder="123456789"
               autoComplete="off"
               className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500 pr-10"
@@ -150,6 +163,8 @@ export default function SignupForm() {
             name="password"
             type={showPassword ? "text" : "password"}
             required
+            minLength={MIN_PASSWORD_LENGTH}
+            title={`Password must be at least ${MIN_PASSWORD_LENGTH} characters`}
             placeholder="••••••••"
             autoComplete="new-password"
             className="w-full px-4 py-3 rounded-lg border border-slate-700 bg-slate-900/50 hover:border-slate-500 focus:border-nanobank-blue-sky focus:outline-none transition-colors duration-200 text-sm placeholder:text-slate-500 pr-10"
