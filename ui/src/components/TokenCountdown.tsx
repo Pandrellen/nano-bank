@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { refreshSessionAction, type RefreshResult } from "@/actions/auth";
-import { REFRESH_LEAD_MS } from "@/lib/config";
+import { REFRESH_LEAD_MS } from "@/lib/client-config";
 
 // Module-level, not per-instance: the refresh token is single-use, so two
 // concurrent refreshes (React StrictMode's dev double-mount, or more than one

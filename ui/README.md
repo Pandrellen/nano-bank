@@ -43,7 +43,6 @@ Create a `.env` file in the root of the `ui` directory:
 
 ```bash
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8081
-TOKEN_MAX_AGE_SECONDS=604800
 ```
 
 ## Running
