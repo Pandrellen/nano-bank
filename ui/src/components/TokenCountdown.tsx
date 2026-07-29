@@ -36,8 +36,10 @@ export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
           result = { success: false as const };
         }
 
-        if (result.success && result.expiresAt) {
-          setExpiry(result.expiresAt);
+        if (result.success) {
+          if (result.expiresAt) {
+            setExpiry(result.expiresAt);
+          }
           setIsRefreshing(false);
           refreshInFlight.current = false;
         } else {

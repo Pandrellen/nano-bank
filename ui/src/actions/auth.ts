@@ -195,7 +195,9 @@ export async function refreshSessionAction(): Promise<RefreshResult> {
   const data: LoginResponseBody = await response.json();
   await setSessionCookies(data);
 
-  return { success: true, expiresAt: decodeJwtExpiry(data.access_token) ?? undefined };
+  const expiresAt = decodeJwtExpiry(data.access_token) ?? Math.floor(Date.now() / 1000) + data.expires_in;
+
+  return { success: true, expiresAt };
 }
 
 export async function logoutAction(): Promise<void> {
