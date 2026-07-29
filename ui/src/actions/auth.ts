@@ -3,7 +3,7 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { decodeJwtExpiry } from "@/lib/jwt";
-import { API_BASE_URL, REFRESH_TOKEN_MAX_AGE_SECONDS } from "@/lib/config";
+import { API_BASE_URL, TOKEN_MAX_AGE_SECONDS } from "@/lib/config";
 
 /** Mirrors the API's `{ "error": { "code", "message", "details" } }` envelope
  * (see api/src/errors/mod.rs — every AppError variant serializes to this shape). */
@@ -24,21 +24,21 @@ interface LoginResponseBody {
   expires_in: number;
 }
 
-async function setSessionCookies({ access_token, refresh_token, expires_in }: LoginResponseBody) {
+async function setSessionCookies({ access_token, refresh_token }: LoginResponseBody) {
   const cookieStore = await cookies();
   cookieStore.set("access_token", access_token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     path: "/",
-    maxAge: expires_in,
+    maxAge: TOKEN_MAX_AGE_SECONDS,
   });
   cookieStore.set("refresh_token", refresh_token, {
     httpOnly: true,
     secure: process.env.NODE_ENV === "production",
     sameSite: "lax",
     path: "/",
-    maxAge: REFRESH_TOKEN_MAX_AGE_SECONDS,
+    maxAge: TOKEN_MAX_AGE_SECONDS,
   });
 }
 

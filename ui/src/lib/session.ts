@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { refreshSessionAction } from "@/actions/auth";
 import { API_BASE_URL } from "@/lib/config";
 
 export interface CustomerProfile {
@@ -33,8 +34,16 @@ export async function verifySession(accessToken: string | undefined): Promise<Cu
  * sign-in if it's missing or invalid, otherwise returns the token and profile. */
 export async function requireSession(): Promise<Session> {
   const cookieStore = await cookies();
-  const accessToken = cookieStore.get("access_token")?.value;
-  const profile = await verifySession(accessToken);
+  let accessToken = cookieStore.get("access_token")?.value;
+  let profile = await verifySession(accessToken);
+
+  if (!profile) {
+    const refreshResult = await refreshSessionAction();
+    if (refreshResult.success) {
+      accessToken = cookieStore.get("access_token")?.value;
+      profile = await verifySession(accessToken);
+    }
+  }
 
   if (!accessToken || !profile) {
     redirect("/auth/signin");
