@@ -10,6 +10,7 @@ interface FooterProps {
 }
 
 const DEFAULT_LINKS: FooterLink[] = [
+  { label: "Health Check", href: "/health" },
   { label: "Privacy Policy", href: "/privacy" },
   { label: "Terms of Service", href: "/terms" },
 ];
