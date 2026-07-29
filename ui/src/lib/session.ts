@@ -1,6 +1,5 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { refreshSessionAction } from "@/actions/auth";
 import { API_BASE_URL } from "@/lib/config";
 
 export interface CustomerProfile {
@@ -46,37 +45,28 @@ export async function verifySession(accessToken: string | undefined): Promise<Se
   }
 }
 
-/** For protected Server Components: verifies the session cookie and redirects to
- * sign-in if it's missing or invalid, otherwise returns the token and profile.
- * An infra error (network/5xx from either the profile check or the refresh
- * call) throws instead of redirecting — the session may still be good, so it's
- * left alone rather than being treated as signed out. */
+/** For protected Server Components: verifies the session cookie and returns the
+ * token and profile. An infra error (network/5xx from the profile check) throws
+ * instead of redirecting — the session may still be good, so it's left alone
+ * rather than being treated as signed out.
+ *
+ * When the access token is missing or expired, refreshing it requires writing
+ * new cookies, which a Server Component render is not allowed to do. So instead
+ * of refreshing here we hand off to the `/api/auth/refresh` Route Handler (via
+ * redirect), which rotates the tokens and redirects back — or to sign-in if the
+ * session is genuinely over. */
 export async function requireSession(): Promise<Session> {
   const cookieStore = await cookies();
-  let accessToken = cookieStore.get("access_token")?.value;
-  let verification = await verifySession(accessToken);
+  const accessToken = cookieStore.get("access_token")?.value;
+  const verification = await verifySession(accessToken);
 
   if (verification.status === "error") {
     throw new Error("Unable to verify session: the API is unreachable or returned an error.");
   }
 
   if (verification.status === "unauthorized") {
-    const refreshResult = await refreshSessionAction();
-    if (refreshResult.status === "error") {
-      throw new Error("Unable to refresh session: the API is unreachable or returned an error.");
-    }
-    if (refreshResult.status === "refreshed") {
-      accessToken = cookieStore.get("access_token")?.value;
-      verification = await verifySession(accessToken);
-      if (verification.status === "error") {
-        throw new Error("Unable to verify session: the API is unreachable or returned an error.");
-      }
-    }
+    redirect("/api/auth/refresh?next=/dashboard");
   }
 
-  if (verification.status !== "valid" || !accessToken) {
-    redirect("/auth/signin");
-  }
-
-  return { accessToken, profile: verification.profile };
+  return { accessToken: accessToken!, profile: verification.profile };
 }

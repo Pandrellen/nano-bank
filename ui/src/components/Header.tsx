@@ -4,7 +4,9 @@ import { logoutAction } from "../actions/auth";
 
 export default async function Header() {
     const cookieStore = await cookies();
-    const isAuthenticated = Boolean(cookieStore.get("access_token")?.value);
+    // The refresh_token is the durable session marker; the access_token is
+    // short-lived and can be absent between refreshes while the session is live.
+    const isAuthenticated = Boolean(cookieStore.get("refresh_token")?.value);
 
     return (
         <header className="relative z-10 w-full max-w-7xl mx-auto px-6 py-6 flex items-center justify-between">
