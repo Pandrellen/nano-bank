@@ -43,6 +43,7 @@ Create a `.env` file in the root of the `ui` directory:
 
 ```bash
 NEXT_PUBLIC_API_BASE_URL=http://localhost:8081
+TOKEN_MAX_AGE_SECONDS=604800
 ```
 
 ## Running
@@ -63,3 +64,5 @@ npm run dev
 1. Multi-tab is silently broken. If a user has the dashboard open in two tabs, whichever tab refreshes first invalidates the token the other tab is about to send, and that second tab gets bounced to sign-in even though the session is fine.
 
 2. Zero tests in "ui" currently. Look to add some Playwright tests for the golden path (sign up → sign in → dashboard shows countdown → logout) would be valuable at a later stage.
+
+3. lucide-react is added but not currently used, there is intention to use it imminently.
