@@ -4,3 +4,6 @@ export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://loca
 export const TOKEN_MAX_AGE_SECONDS = Number(
   process.env.TOKEN_MAX_AGE_SECONDS || 60 * 60 * 24 * 7,
 );
+
+// How far ahead of access-token expiry to proactively refresh.
+export const REFRESH_LEAD_MS = 30_000;

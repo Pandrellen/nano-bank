@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { refreshSessionAction } from "../actions/auth";
+import { refreshSessionAction } from "@/actions/auth";
+import { REFRESH_LEAD_MS } from "@/lib/config";
 
 function formatRemaining(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -23,7 +24,7 @@ export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
       const msLeft = expiry * 1000 - Date.now();
       setRemaining(msLeft);
 
-      if (msLeft <= 0 && !refreshInFlight.current) {
+      if (msLeft <= REFRESH_LEAD_MS && !refreshInFlight.current) {
         refreshInFlight.current = true;
         setIsRefreshing(true);
 
