@@ -52,17 +52,22 @@ export default function TokenCountdown({ expiresAt }: { expiresAt: number }) {
           result = await refreshSessionOnce();
         } catch (error) {
           console.error("Token refresh failed:", error);
-          result = { success: false as const };
+          result = { status: "error" };
         }
 
-        if (result.success) {
+        if (result.status === "refreshed") {
           if (result.expiresAt) {
             setExpiry(result.expiresAt);
           }
           setIsRefreshing(false);
           refreshInFlight.current = false;
-        } else {
+        } else if (result.status === "unauthorized") {
           router.push("/auth/signin");
+        } else {
+          // Transient failure (network/5xx) — session may still be fine, so
+          // don't sign the user out. Stay in the refreshing state and retry
+          // on the next tick.
+          refreshInFlight.current = false;
         }
       }
     };

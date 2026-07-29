@@ -158,21 +158,24 @@ export async function signInAction(formData: FormData): Promise<SignInResult> {
   };
 }
 
-export interface RefreshResult {
-  success: boolean;
-  expiresAt?: number;
-}
+/** `unauthorized` means the session is truly over (refresh token missing,
+ * expired, or already used) — cookies are cleared. `error` means the request
+ * itself failed (network blip, 5xx) and says nothing about the session, so
+ * cookies are left alone; the caller should surface an error and let the
+ * caller retry rather than treating it as a sign-out. */
+export type RefreshResult =
+  | { status: "refreshed"; expiresAt?: number }
+  | { status: "unauthorized" }
+  | { status: "error" };
 
 /** Exchanges the refresh_token cookie for a new access/refresh pair. Called by
- * TokenCountdown once the access token's exp passes. On failure the session is
- * truly over (refresh token missing, expired, or already used) — cookies are
- * cleared and the caller should send the user back to sign in. */
+ * TokenCountdown once the access token's exp passes. */
 export async function refreshSessionAction(): Promise<RefreshResult> {
   const cookieStore = await cookies();
   const refreshToken = cookieStore.get("refresh_token")?.value;
 
   if (!refreshToken) {
-    return { success: false };
+    return { status: "unauthorized" };
   }
 
   let response: Response;
@@ -185,14 +188,18 @@ export async function refreshSessionAction(): Promise<RefreshResult> {
     });
   } catch (error) {
     console.error("Token refresh request failed:", error);
-    return { success: false };
+    return { status: "error" };
   }
 
   if (!response.ok) {
+    if (response.status !== 401) {
+      console.error(`Token refresh failed with status ${response.status}`);
+      return { status: "error" };
+    }
     cookieStore.delete("access_token");
     cookieStore.delete("refresh_token");
     revalidatePath("/", "layout");
-    return { success: false };
+    return { status: "unauthorized" };
   }
 
   const data: LoginResponseBody = await response.json();
@@ -200,7 +207,7 @@ export async function refreshSessionAction(): Promise<RefreshResult> {
 
   const expiresAt = decodeJwtExpiry(data.access_token) ?? Math.floor(Date.now() / 1000) + data.expires_in;
 
-  return { success: true, expiresAt };
+  return { status: "refreshed", expiresAt };
 }
 
 export async function logoutAction(): Promise<void> {
