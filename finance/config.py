@@ -52,6 +52,15 @@ class RiskConfig:
         ratio = Decimal(e.get("RISK_TARGET_RATIO", "0.10"))
         default_w = Decimal(e.get("RISK_DEFAULT_ASSET_WEIGHT",
                                   str(_DEFAULT_ASSET_WEIGHT)))
+        # Enforce the invariant the fallback weight exists to protect: a zero (or
+        # negative) default treats every unmapped asset as risk-free, collapsing
+        # RWA and economic capital and making RAROC explode. Fail loudly at load
+        # rather than emit silently-wrong capital numbers downstream.
+        if default_w <= 0:
+            raise ValueError(
+                "RISK_DEFAULT_ASSET_WEIGHT must be > 0 "
+                f"(got {default_w}); a zero/negative default risk-weights "
+                "unmapped assets as risk-free and collapses the capital model")
         return cls(risk_weights=weights, loss_rates=loss, target_ratio=ratio,
                    default_asset_weight=default_w)
 

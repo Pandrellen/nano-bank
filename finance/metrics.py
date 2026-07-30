@@ -24,12 +24,23 @@ def economic_capital(snapshot: dict, risk: RiskConfig) -> dict:
     to `default_asset_weight` is named: a fallback weight is an assumption, not
     a policy, and a caller reporting it as bank policy would be overstating how
     deliberate the capital charge is.
+
+    A role carrying a balance that `roles.STATEMENT_LINE` classifies as neither
+    asset nor anything else (an unclassified role — e.g. a new GL role added
+    without updating the map) is dropped from RWA here. That is the same silent
+    blind spot as an unweighted asset, so it is named in `unclassified_roles`
+    rather than vanishing: a nonzero unclassified balance may be an asset the
+    capital charge is missing.
     """
     rwa: dict[str, Decimal] = {}
     used: dict[str, Decimal] = {}
     assumed: list[str] = []
+    unclassified: list[str] = []
     for role in set(snapshot) | set(risk.risk_weights):
-        if roles.STATEMENT_LINE.get(role) != "asset":
+        line = roles.STATEMENT_LINE.get(role)
+        if line != "asset":
+            if line is None and snapshot.get(role, Decimal(0)) != 0:
+                unclassified.append(role)
             continue
         weight = risk.risk_weights.get(role)
         if weight is None:
@@ -40,6 +51,7 @@ def economic_capital(snapshot: dict, risk: RiskConfig) -> dict:
     total = sum(rwa.values(), Decimal(0))
     return {"rwa": rwa, "total_rwa": total,
             "risk_weights": used, "assumed_weight_roles": sorted(assumed),
+            "unclassified_roles": sorted(unclassified),
             "economic_capital": (total * risk.target_ratio).quantize(Decimal("0.01"))}
 
 

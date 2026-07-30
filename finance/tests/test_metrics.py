@@ -170,6 +170,24 @@ def test_economic_capital_flags_roles_that_fell_back_to_the_default():
     assert ec["risk_weights"]["Receivable"] == RC.default_asset_weight
 
 
+def test_economic_capital_flags_unclassified_roles_it_dropped():
+    """A role `STATEMENT_LINE` doesn't classify at all (e.g. a new GL role added
+    without updating the map) carries a balance but is dropped from RWA. That is
+    the same silent blind spot as an unweighted asset, so a nonzero one must be
+    named rather than vanish."""
+    ec = metrics.economic_capital({"MysteryLedger": D("5000")}, RC)
+    assert ec["unclassified_roles"] == ["MysteryLedger"]
+    assert ec["total_rwa"] == D("0")   # it was dropped from the charge
+
+
+def test_economic_capital_does_not_flag_zero_or_known_nonasset_roles():
+    # A zero-balance unclassified role is not worth flagging; a classified
+    # non-asset (a liability) is correctly excluded, not "unclassified".
+    ec = metrics.economic_capital(
+        {"MysteryLedger": D("0"), "CustomerDeposits": D("-4000")}, RC)
+    assert ec["unclassified_roles"] == []
+
+
 def test_raroc_reports_the_credit_exposure_and_loss_rate():
     """Otherwise the only way to say 'expected loss is ~1.8% of the book' is to
     divide by hand — which is exactly the arithmetic callers are told not to do."""

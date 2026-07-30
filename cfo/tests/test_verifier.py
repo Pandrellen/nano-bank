@@ -72,6 +72,18 @@ def test_percent_matches_ratio_form_within_rounding():
     assert verifier.ungrounded("ROE is 21.3%.", trace) == []
 
 
+def test_percent_ratio_tolerance_is_scaled_not_percentage_point_loose():
+    """A wrong percent must NOT pass against the ratio-form tool value. The tool
+    returned 0.1290 (12.90%); a claimed 12.50% is off by 0.40 percentage points
+    and has to be flagged. Regression: the half-last-digit tolerance was derived
+    from the percent text but applied to the ratio target unscaled (~100x too
+    loose), so |0.1290 - 0.125| = 0.004 slipped under a 0.005 tolerance."""
+    trace = _trace("{'roe': '0.1290'}")
+    assert verifier.ungrounded("ROE is 12.50%.", trace) == ["12.50%"]
+    # the correct figure still grounds
+    assert verifier.ungrounded("ROE is 12.90%.", trace) == []
+
+
 def test_currency_matches_after_separator_strip():
     trace = _trace("{'total_assets': '815636.08'}")
     assert verifier.ungrounded("Total assets $815,636.08.", trace) == []

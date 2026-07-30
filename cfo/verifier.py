@@ -95,13 +95,19 @@ def _close(grounded: Decimal, target: Decimal, decimals: int) -> bool:
 
 
 def _is_grounded(fig: Figure, grounded: list[Decimal]) -> bool:
-    targets = [fig.value]
+    # (target, displayed-precision) pairs. A percent in prose ("12.50%", 2 dp) is
+    # matched two ways: against a tool value already in percent units at the shown
+    # precision, and against the ratio form tools actually store (0.1250). The
+    # ratio form is two decimal places finer (0.001250), so its tolerance must
+    # scale with it — otherwise the half-last-digit tolerance stays in
+    # percentage-point units and is ~100x too loose, accepting "12.50%" against a
+    # tool ratio of 0.1290 (12.90%).
+    targets = [(fig.value, fig.decimals)]
     if fig.is_percent:
-        # tools store the ratio; prose shows the percent
-        targets.append(fig.value / Decimal(100))
-    for t in targets:
+        targets.append((fig.value / Decimal(100), fig.decimals + 2))
+    for t, dp in targets:
         for g in grounded:
-            if _close(g, t, fig.decimals):
+            if _close(g, t, dp):
                 return True
     return False
 

@@ -1,4 +1,5 @@
 from decimal import Decimal as D
+import pytest
 from finance.config import RiskConfig
 
 
@@ -25,3 +26,16 @@ def test_from_env_overrides_target_and_a_weight():
     assert rc.risk_weights["CardReceivable"] == D("0.80")
     assert rc.risk_weights["TreasuryPlacement"] == D("0.20")   # untouched default
     assert rc.loss_rates["LoansReceivable"] == D("0.02")
+
+
+def test_from_env_can_override_default_asset_weight():
+    rc = RiskConfig.from_env({"RISK_DEFAULT_ASSET_WEIGHT": "1.50"})
+    assert rc.default_asset_weight == D("1.50")
+
+
+@pytest.mark.parametrize("bad", ["0", "0.00", "-0.5"])
+def test_from_env_rejects_nonpositive_default_asset_weight(bad):
+    # A zero/negative default treats unmapped assets as risk-free and collapses
+    # the capital model — it must fail loudly at load, not silently.
+    with pytest.raises(ValueError):
+        RiskConfig.from_env({"RISK_DEFAULT_ASSET_WEIGHT": bad})
