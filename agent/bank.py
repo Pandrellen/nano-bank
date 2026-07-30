@@ -31,6 +31,18 @@ class BankClient:
         out = self._post("/api/v1/auth/login", {"email": email, "password": password})
         return out.get("access_token") or out["token"]
 
+    def _get(self, path: str, token: Optional[str] = None) -> dict:
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        r = self.http.get(self.base + path, headers=headers)
+        if r.status_code // 100 != 2:
+            raise BankError(r.status_code, _safe_json(r))
+        return _safe_json(r)
+
+    def profile(self, token) -> dict:
+        """GET /api/v1/customers/profile — returns the authenticated customer
+        (includes `customer_id`)."""
+        return self._get("/api/v1/customers/profile", token=token)
+
     def deposit(self, token, account_id, amount, description="Deposit",
                 idempotency_key=None) -> dict:
         return self._post("/api/v1/transactions/deposit",
