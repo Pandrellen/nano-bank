@@ -53,9 +53,11 @@ def _existing_chequing(psql, email: str) -> str:
 
 
 def _salary_count(psql, account_id: str) -> int:
+    # `transactions` has no account_id; account linkage is via transaction_entries.
     out = _q(psql, (
-        "SELECT COUNT(*) FROM transactions "
-        f"WHERE account_id='{account_id}' AND description='Salary';"))
+        "SELECT COUNT(DISTINCT t.transaction_id) FROM transactions t "
+        "JOIN transaction_entries e ON e.transaction_id=t.transaction_id "
+        f"WHERE e.account_id='{account_id}' AND t.description='Salary';"))
     return int(out or "0")
 
 
@@ -87,8 +89,12 @@ def seed(bank, psql, now, *, profile=None, email=DEMO_EMAIL, password=DEMO_PASSW
     # 3. idempotent: skip if history already present
     if _salary_count(psql, account_id) > 0:
         return {"email": email, "account_id": account_id, "posted": 0, "skipped": True}
-    # 4. raise the daily withdrawal cap so the bulk backfill isn't rejected
-    psql(f"UPDATE account_limits SET daily_withdrawal_limit=100000000 WHERE account_id='{account_id}';")
+    # 4. raise the daily withdrawal cap so the bulk backfill isn't rejected.
+    # The limits row is created lazily (INSERT ... ON CONFLICT DO NOTHING) by the
+    # first withdrawal with the $1000 default, so upsert it high up front.
+    psql("INSERT INTO account_limits (account_id, daily_withdrawal_limit) "
+         f"VALUES ('{account_id}', 100000000) "
+         "ON CONFLICT (account_id) DO UPDATE SET daily_withdrawal_limit=100000000;")
     # 5. post cycles (salary first each month) and collect ids to backdate
     rows: "list[tuple[str, datetime]]" = []
     for it in monthly_schedule(now):
