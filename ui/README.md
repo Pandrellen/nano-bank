@@ -62,8 +62,27 @@ npm run dev
 ## Notes
 1. Multi-tab is silently broken. If a user has the dashboard open in two tabs, whichever tab refreshes first invalidates the token the other tab is about to send, and that second tab gets bounced to sign-in even though the session is fine.
 
-2. Zero tests in "ui" currently. Look to add some Playwright tests for the golden path (sign up → sign in → dashboard shows countdown → logout) would be valuable at a later stage.
+2. Tests: unit tests run with `npm test` (vitest); an end-to-end auth suite lives in `e2e/` and runs against a live stack via `../scripts/e2e-ui.sh` (needs Node 20).
 
 3. lucide-react is added but not currently used, there is intention to use it imminently.
 
 4. Learn More on the main page is a dead link at present.
+
+## Demo account
+
+A ready-made customer with a realistic profile and **6 months of backdated
+salary + expense history**, for showing the UI and the personal-manager agent.
+
+```bash
+./scripts/deploy-all.sh     # full stack up (Postgres + modern core + API + UI)
+./scripts/demo-seed.sh      # seed the demo customer (idempotent, re-runnable)
+```
+
+- **Log in** at `http://localhost:3000` with **`demo@nano.bank` / `Demo-Pass-2026`**.
+- **Talk to the agent:** `kubectl -n nano-bank port-forward svc/agent-console 8505:8505`,
+  open `http://localhost:8505`, click **Seed demo**, pick **Jordan Demo**, and ask
+  e.g. *"summarize my salary and spending over the last 6 months."*
+
+The seeder posts every transaction through the bank API (so ledger invariants
+hold) and then backdates the timestamps via `kubectl exec … psql` — direct SQL is
+confined to this demo tool. See `docs/specs/2026-07-29-demo-account-seed-design.md`.
