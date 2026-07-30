@@ -1,7 +1,19 @@
 import { test, expect, type Page } from "@playwright/test";
 
+// Monotonic per-run suffix so distinct signups never collide, even within the
+// same millisecond. email and phone_number are both UNIQUE in the DB.
+let seq = 0;
+function uniqueSuffix() {
+  seq += 1;
+  return `${Date.now()}${seq}`;
+}
+
 function uniqueEmail() {
-  return `e2e+${Date.now()}@example.com`;
+  return `e2e+${uniqueSuffix()}@example.com`;
+}
+
+function uniquePhone() {
+  return uniqueSuffix().slice(-10).padStart(10, "0");
 }
 
 const PASSWORD = "password123";
@@ -11,7 +23,7 @@ async function signUp(page: Page, email: string) {
   await page.getByLabel(/first name/i).fill("Test");
   await page.getByLabel(/last name/i).fill("User");
   await page.getByLabel(/email/i).fill(email);
-  await page.getByLabel(/phone/i).fill("5551234567");
+  await page.getByLabel(/phone/i).fill(uniquePhone());
   await page.getByLabel(/date of birth/i).fill("1990-01-01");
   await page.getByLabel(/sin/i).fill("123456789");
   await page.getByLabel(/password/i).fill(PASSWORD);
