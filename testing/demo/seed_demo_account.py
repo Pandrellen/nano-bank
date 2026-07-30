@@ -103,3 +103,34 @@ def seed(bank, psql, now, *, profile=None, email=DEMO_EMAIL, password=DEMO_PASSW
          "daily_withdrawal_used=0, daily_transfer_used=0 "
          f"WHERE account_id='{account_id}';")
     return {"email": email, "account_id": account_id, "posted": len(rows), "skipped": False}
+
+
+import subprocess
+import sys
+import os
+
+
+def kubectl_psql(sql: str) -> str:
+    cmd = ["kubectl", "exec", "-n", "nano-bank", "deploy/postgres", "--",
+           "psql", "-U", "nanobank_user", "-d", "nano_bank_db",
+           "-v", "ON_ERROR_STOP=1", "-t", "-A", "-c", sql]
+    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+def main(argv=None) -> int:
+    import argparse
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    from agent.bank import BankClient  # reuse the tested client
+    p = argparse.ArgumentParser()
+    p.add_argument("--api", default="http://localhost:8081")
+    args = p.parse_args(argv)
+    out = seed(BankClient(args.api), kubectl_psql, datetime.now())
+    print(f"\nDemo account ready: {out}")
+    print(f"  UI login:  {DEMO_EMAIL} / {DEMO_PASSWORD}  at http://localhost:3000")
+    print("  Agent:     kubectl -n nano-bank port-forward svc/agent-console 8505:8505")
+    print("             then open http://localhost:8505, click 'Seed demo', pick Jordan Demo")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
