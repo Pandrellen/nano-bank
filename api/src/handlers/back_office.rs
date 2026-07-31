@@ -21,6 +21,7 @@ pub fn back_office_routes() -> Router<AppState> {
         .route("/ops/float", get(ops_float))
         .route("/ops/transactions", get(ops_transactions))
         .route("/ops/rails", get(ops_rails))
+        .route("/ops/exceptions", get(ops_exceptions))
 }
 
 #[derive(Serialize)]
@@ -213,5 +214,85 @@ async fn ops_rails(
         window,
         since,
         rails: RailsBreakdown { interac, aft, lynx },
+    }))
+}
+
+#[derive(Serialize)]
+struct ExceptionCounts {
+    failed_transactions: i64,
+    reversals: i64,
+    returned_aft_entries: i64,
+    rejected_aft_entries: i64,
+    wire_recalls: i64,
+}
+
+#[derive(Serialize)]
+struct ExceptionsResponse {
+    window: String,
+    since: DateTime<Utc>,
+    exceptions: ExceptionCounts,
+}
+
+async fn count_since(
+    pool: &DatabasePool,
+    sql: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, AppError> {
+    sqlx::query_scalar::<_, i64>(sql)
+        .bind(since)
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::Database)
+}
+
+/// Counts of the operational exceptions the ledger actually **records** over a
+/// window: failed transactions, reversals, returned/rejected AFT entries, and
+/// Lynx wire recalls. Note: declined authorizations and NSF-at-authorization are
+/// not persisted as rows today, so they are not (and cannot yet be) counted here
+/// — surfacing them would need new instrumentation (a later phase).
+async fn ops_exceptions(
+    _: AuthenticatedService,
+    State(state): State<AppState>,
+    Query(q): Query<WindowQuery>,
+) -> Result<Json<ExceptionsResponse>, AppError> {
+    let window = q.window.unwrap_or_else(|| "24h".to_string());
+    let since = window_cutoff(&window)?;
+    let p = &state.pool;
+    let exceptions = ExceptionCounts {
+        failed_transactions: count_since(
+            p,
+            "SELECT COUNT(*) FROM transactions WHERE status = 'failed' AND created_at >= $1",
+            since,
+        )
+        .await?,
+        reversals: count_since(
+            p,
+            "SELECT COUNT(*) FROM transaction_reversals WHERE created_at >= $1",
+            since,
+        )
+        .await?,
+        returned_aft_entries: count_since(
+            p,
+            "SELECT COUNT(*) FROM aft_entries WHERE status = 'returned' AND created_at >= $1",
+            since,
+        )
+        .await?,
+        rejected_aft_entries: count_since(
+            p,
+            "SELECT COUNT(*) FROM aft_entries WHERE status = 'rejected' AND created_at >= $1",
+            since,
+        )
+        .await?,
+        wire_recalls: count_since(
+            p,
+            "SELECT COUNT(*) FROM lynx_recalls WHERE created_at >= $1",
+            since,
+        )
+        .await?,
+    };
+    Ok(Json(ExceptionsResponse {
+        window,
+        since,
+        exceptions,
     }))
 }

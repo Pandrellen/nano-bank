@@ -229,3 +229,45 @@ async fn rails_summary_returns_per_rail_groups() {
         "lynx group should be an array"
     );
 }
+
+#[tokio::test]
+async fn exceptions_summary_returns_recorded_counts() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!(
+            "{}/api/v1/back-office/ops/exceptions?window=30d",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("exceptions request");
+    assert!(resp.status().is_success(), "exceptions: {}", resp.status());
+
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["window"], "30d");
+    assert!(
+        body["since"].is_string(),
+        "since should be an rfc3339 string"
+    );
+    let ex = &body["exceptions"];
+    for k in [
+        "failed_transactions",
+        "reversals",
+        "returned_aft_entries",
+        "rejected_aft_entries",
+        "wire_recalls",
+    ] {
+        assert!(
+            ex[k].is_u64(),
+            "exceptions.{k} should be a count, got {:?}",
+            ex[k]
+        );
+    }
+}
