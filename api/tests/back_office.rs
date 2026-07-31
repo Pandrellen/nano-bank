@@ -189,3 +189,43 @@ async fn transactions_summary_rejects_bad_window() {
         "unsupported window must be a 400"
     );
 }
+
+#[tokio::test]
+async fn rails_summary_returns_per_rail_groups() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!(
+            "{}/api/v1/back-office/ops/rails?window=30d",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("rails request");
+    assert!(resp.status().is_success(), "rails: {}", resp.status());
+
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["window"], "30d");
+    assert!(
+        body["since"].is_string(),
+        "since should be an rfc3339 string"
+    );
+    assert!(
+        body["rails"]["interac"].is_array(),
+        "interac group should be an array"
+    );
+    assert!(
+        body["rails"]["aft"].is_array(),
+        "aft group should be an array"
+    );
+    assert!(
+        body["rails"]["lynx"].is_array(),
+        "lynx group should be an array"
+    );
+}

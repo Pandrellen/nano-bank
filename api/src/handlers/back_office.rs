@@ -11,6 +11,7 @@ use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::config::database::DatabasePool;
 use crate::errors::AppError;
 use crate::handlers::AppState;
 use crate::middleware::auth::AuthenticatedService;
@@ -19,6 +20,7 @@ pub fn back_office_routes() -> Router<AppState> {
     Router::new()
         .route("/ops/float", get(ops_float))
         .route("/ops/transactions", get(ops_transactions))
+        .route("/ops/rails", get(ops_rails))
 }
 
 #[derive(Serialize)]
@@ -149,5 +151,67 @@ async fn ops_transactions(
         window,
         since,
         groups,
+    }))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct RailGroup {
+    status: String,
+    count: i64,
+    total: Decimal,
+}
+
+#[derive(Serialize)]
+struct RailsBreakdown {
+    interac: Vec<RailGroup>,
+    aft: Vec<RailGroup>,
+    lynx: Vec<RailGroup>,
+}
+
+#[derive(Serialize)]
+struct RailsResponse {
+    window: String,
+    since: DateTime<Utc>,
+    rails: RailsBreakdown,
+}
+
+/// Count + summed amount grouped by status for one rail table over a window.
+/// `table` is always a hardcoded literal below (never user input), so the
+/// interpolation is safe; the window value is bound.
+async fn rail_groups(
+    pool: &DatabasePool,
+    table: &str,
+    since: DateTime<Utc>,
+) -> Result<Vec<RailGroup>, AppError> {
+    let sql = format!(
+        "SELECT status::text AS status, COUNT(*) AS count, COALESCE(SUM(amount), 0) AS total
+         FROM {table}
+         WHERE created_at >= $1
+         GROUP BY status
+         ORDER BY status"
+    );
+    sqlx::query_as::<_, RailGroup>(&sql)
+        .bind(since)
+        .fetch_all(pool)
+        .await
+        .map_err(AppError::Database)
+}
+
+/// Per-rail activity (Interac / AFT / Lynx) grouped by status over a window —
+/// the throughput/backlog signal the COO reads. Read-only aggregate.
+async fn ops_rails(
+    _: AuthenticatedService,
+    State(state): State<AppState>,
+    Query(q): Query<WindowQuery>,
+) -> Result<Json<RailsResponse>, AppError> {
+    let window = q.window.unwrap_or_else(|| "24h".to_string());
+    let since = window_cutoff(&window)?;
+    let interac = rail_groups(&state.pool, "interac_etransfers", since).await?;
+    let aft = rail_groups(&state.pool, "aft_entries", since).await?;
+    let lynx = rail_groups(&state.pool, "lynx_wires", since).await?;
+    Ok(Json(RailsResponse {
+        window,
+        since,
+        rails: RailsBreakdown { interac, aft, lynx },
     }))
 }
