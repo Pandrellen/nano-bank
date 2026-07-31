@@ -22,6 +22,7 @@ pub fn back_office_routes() -> Router<AppState> {
         .route("/ops/transactions", get(ops_transactions))
         .route("/ops/rails", get(ops_rails))
         .route("/ops/exceptions", get(ops_exceptions))
+        .route("/ops/cards", get(ops_cards))
 }
 
 #[derive(Serialize)]
@@ -294,5 +295,74 @@ async fn ops_exceptions(
         window,
         since,
         exceptions,
+    }))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct HoldsSummary {
+    open_count: i64,
+    open_amount: Decimal,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct CardTxnGroup {
+    transaction_type: String,
+    status: String,
+    count: i64,
+    total: Decimal,
+}
+
+#[derive(Serialize)]
+struct CardsResponse {
+    window: String,
+    since: DateTime<Utc>,
+    /// Point-in-time (not windowed): authorization holds currently open.
+    authorization_holds: HoldsSummary,
+    /// Card-tagged transactions (`product = 'card'`) over the window.
+    card_transactions: Vec<CardTxnGroup>,
+}
+
+/// Observable card operations: currently-open authorization holds (a now
+/// snapshot) plus card-tagged transactions grouped by type and status over the
+/// window. Approval/decline *rates* are intentionally absent — declined
+/// authorizations are not persisted as rows today, so a rate cannot be computed
+/// without new instrumentation (a later phase).
+async fn ops_cards(
+    _: AuthenticatedService,
+    State(state): State<AppState>,
+    Query(q): Query<WindowQuery>,
+) -> Result<Json<CardsResponse>, AppError> {
+    let window = q.window.unwrap_or_else(|| "24h".to_string());
+    let since = window_cutoff(&window)?;
+
+    let authorization_holds = sqlx::query_as::<_, HoldsSummary>(
+        "SELECT COUNT(*) AS open_count, COALESCE(SUM(amount), 0) AS open_amount
+         FROM account_holds
+         WHERE released_at IS NULL",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    let card_transactions = sqlx::query_as::<_, CardTxnGroup>(
+        "SELECT transaction_type,
+                status::text AS status,
+                COUNT(*) AS count,
+                COALESCE(SUM(amount), 0) AS total
+         FROM transactions
+         WHERE product = 'card' AND created_at >= $1
+         GROUP BY transaction_type, status
+         ORDER BY transaction_type, status",
+    )
+    .bind(since)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(CardsResponse {
+        window,
+        since,
+        authorization_holds,
+        card_transactions,
     }))
 }

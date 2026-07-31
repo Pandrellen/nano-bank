@@ -271,3 +271,43 @@ async fn exceptions_summary_returns_recorded_counts() {
         );
     }
 }
+
+#[tokio::test]
+async fn cards_summary_returns_holds_and_txn_groups() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!(
+            "{}/api/v1/back-office/ops/cards?window=30d",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("cards request");
+    assert!(resp.status().is_success(), "cards: {}", resp.status());
+
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["window"], "30d");
+    assert!(
+        body["since"].is_string(),
+        "since should be an rfc3339 string"
+    );
+    assert!(
+        body["authorization_holds"]["open_count"].is_u64(),
+        "open_count should be a count"
+    );
+    assert!(
+        body["authorization_holds"]["open_amount"].is_string(),
+        "open_amount should be a decimal string"
+    );
+    assert!(
+        body["card_transactions"].is_array(),
+        "card_transactions should be an array"
+    );
+}
