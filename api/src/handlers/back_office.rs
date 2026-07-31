@@ -2,16 +2,23 @@
 //! perception surface). Bank-wide aggregates with no customer identity; every
 //! route requires a service token. The customer-plane handlers are untouched,
 //! and no fraud table is ever read here.
-use axum::{extract::State, routing::get, Json, Router};
+use axum::{
+    extract::{Query, State},
+    routing::get,
+    Json, Router,
+};
+use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::AppError;
 use crate::handlers::AppState;
 use crate::middleware::auth::AuthenticatedService;
 
 pub fn back_office_routes() -> Router<AppState> {
-    Router::new().route("/ops/float", get(ops_float))
+    Router::new()
+        .route("/ops/float", get(ops_float))
+        .route("/ops/transactions", get(ops_transactions))
 }
 
 #[derive(Serialize)]
@@ -75,5 +82,72 @@ async fn ops_float(
     Ok(Json(FloatResponse {
         accounts,
         total_float: total,
+    }))
+}
+
+#[derive(Deserialize)]
+struct WindowQuery {
+    window: Option<String>,
+}
+
+/// Map a window shorthand to a cutoff instant. Unknown windows are a 400 so the
+/// caller learns the vocabulary rather than getting silent 24h data.
+fn window_cutoff(window: &str) -> Result<DateTime<Utc>, AppError> {
+    let dur = match window {
+        "24h" => Duration::hours(24),
+        "7d" => Duration::days(7),
+        "30d" => Duration::days(30),
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "unsupported window '{other}' (use 24h|7d|30d)"
+            )))
+        }
+    };
+    Ok(Utc::now() - dur)
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct TxnGroup {
+    transaction_type: String,
+    status: String,
+    count: i64,
+    total: Decimal,
+}
+
+#[derive(Serialize)]
+struct TransactionsResponse {
+    window: String,
+    since: DateTime<Utc>,
+    groups: Vec<TxnGroup>,
+}
+
+/// Bank-wide transaction counts + amounts grouped by type and status over a
+/// window. Read-only aggregate; no customer scoping.
+async fn ops_transactions(
+    _: AuthenticatedService,
+    State(state): State<AppState>,
+    Query(q): Query<WindowQuery>,
+) -> Result<Json<TransactionsResponse>, AppError> {
+    let window = q.window.unwrap_or_else(|| "24h".to_string());
+    let since = window_cutoff(&window)?;
+    let groups = sqlx::query_as::<_, TxnGroup>(
+        "SELECT transaction_type,
+                status::text AS status,
+                COUNT(*) AS count,
+                COALESCE(SUM(amount), 0) AS total
+         FROM transactions
+         WHERE created_at >= $1
+         GROUP BY transaction_type, status
+         ORDER BY transaction_type, status",
+    )
+    .bind(since)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::Database)?;
+
+    Ok(Json(TransactionsResponse {
+        window,
+        since,
+        groups,
     }))
 }

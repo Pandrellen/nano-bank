@@ -131,3 +131,61 @@ async fn float_rejects_a_customer_token() {
         "customer token must be refused on the service plane"
     );
 }
+
+#[tokio::test]
+async fn transactions_summary_returns_grouped_shape() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!(
+            "{}/api/v1/back-office/ops/transactions?window=7d",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("transactions request");
+    assert!(
+        resp.status().is_success(),
+        "transactions: {}",
+        resp.status()
+    );
+
+    let body = resp.json::<Value>().await.unwrap();
+    assert_eq!(body["window"], "7d");
+    assert!(
+        body["since"].is_string(),
+        "since should be an rfc3339 string"
+    );
+    assert!(body["groups"].is_array(), "groups should be an array");
+}
+
+#[tokio::test]
+async fn transactions_summary_rejects_bad_window() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!(
+            "{}/api/v1/back-office/ops/transactions?window=1y",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("transactions request");
+    assert_eq!(
+        resp.status().as_u16(),
+        400,
+        "unsupported window must be a 400"
+    );
+}
