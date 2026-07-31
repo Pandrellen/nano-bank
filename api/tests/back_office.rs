@@ -1,0 +1,133 @@
+//! Integration tests for the service-plane back-office operational reads.
+//!
+//! Graceful-skip harness (mirrors tests/finance.rs): every test probes
+//! `GET /health` and returns early (still passing) when the API is unreachable,
+//! so `cargo test` passes with nothing running. No GL core needed — these are
+//! reads. Run against a live stack:
+//!   cd api && cargo test --test back_office -- --nocapture
+//! Override the base URL with NANO_BANK_TEST_URL.
+
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+const TEST_PASSWORD: &str = "securepass123";
+// Dev service-plane secret (api/config/default.toml). Overridable in CI.
+const SERVICE_SECRET: &str = "nano-bank-visa-network-secret-change-me";
+
+fn base_url() -> String {
+    std::env::var("NANO_BANK_TEST_URL").unwrap_or_else(|_| "http://localhost:8081".to_string())
+}
+
+fn client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
+async fn stack_up(c: &reqwest::Client) -> bool {
+    c.get(format!("{}/health", base_url())).send().await.is_ok()
+}
+
+async fn service_token(c: &reqwest::Client) -> String {
+    let resp = c
+        .post(format!("{}/api/v1/auth/service-token", base_url()))
+        .json(&json!({ "client_secret": SERVICE_SECRET }))
+        .send()
+        .await
+        .expect("service-token request");
+    assert!(
+        resp.status().is_success(),
+        "service-token: {}",
+        resp.status()
+    );
+    resp.json::<Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+// A logged-in customer token, to prove the service plane rejects it. Uses the
+// same registration payload shape as tests/finance.rs (phone_number + sin).
+async fn customer_token(c: &reqwest::Client) -> String {
+    let n = Uuid::new_v4().as_u128();
+    let email = format!("botest_{}@example.com", n % 1_000_000_000);
+    let reg = c
+        .post(format!("{}/api/v1/customers", base_url()))
+        .json(&json!({
+            "email": email,
+            "phone_number": format!("{:010}", n % 10_000_000_000u128),
+            "first_name": "Bo",
+            "last_name": "Tester",
+            "date_of_birth": "1990-01-01",
+            "sin": format!("{:09}", n % 1_000_000_000),
+            "password": TEST_PASSWORD
+        }))
+        .send()
+        .await
+        .expect("register");
+    assert!(reg.status().is_success(), "register: {}", reg.status());
+    let resp = c
+        .post(format!("{}/api/v1/auth/login", base_url()))
+        .json(&json!({ "email": email, "password": TEST_PASSWORD }))
+        .send()
+        .await
+        .expect("login");
+    assert!(resp.status().is_success(), "login: {}", resp.status());
+    resp.json::<Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn float_returns_system_accounts_for_a_service_token() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let svc = service_token(&c).await;
+
+    let resp = c
+        .get(format!("{}/api/v1/back-office/ops/float", base_url()))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .expect("float request");
+    assert!(resp.status().is_success(), "float: {}", resp.status());
+
+    let body = resp.json::<Value>().await.unwrap();
+    let accounts = body["accounts"].as_array().expect("accounts array");
+    assert!(
+        !accounts.is_empty(),
+        "expected the bootstrapped system accounts"
+    );
+    assert!(
+        accounts.iter().any(|a| a["system"] == "system"),
+        "expected a system@ (VISA_CLEARING/BANK_SETTLEMENT) entry, got {accounts:?}"
+    );
+    assert!(
+        body["total_float"].is_string(),
+        "total_float should be a decimal string"
+    );
+}
+
+#[tokio::test]
+async fn float_rejects_a_customer_token() {
+    let c = client();
+    if !stack_up(&c).await {
+        eprintln!("stack down; skipping");
+        return;
+    }
+    let cust = customer_token(&c).await;
+
+    let resp = c
+        .get(format!("{}/api/v1/back-office/ops/float", base_url()))
+        .bearer_auth(&cust)
+        .send()
+        .await
+        .expect("float request");
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "customer token must be refused on the service plane"
+    );
+}

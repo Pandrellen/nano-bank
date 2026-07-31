@@ -176,6 +176,10 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
         )
         // Account routes
         .nest("/api/v1/accounts", handlers::accounts::account_routes())
+        .nest(
+            "/api/v1/back-office",
+            handlers::back_office::back_office_routes(),
+        )
         // Agentic banking: agent registration/metadata, consent mandates, and
         // the mandate-scoped agent surface (no account params — the mandate
         // pins the account)
@@ -186,15 +190,12 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
         .nest("/api/v1/approvals", handlers::approvals::approval_routes())
         // Credit-card payment rails (issuer endpoints)
         .nest("/api/v1/cards", handlers::cards::card_routes())
-
         // Interest / NIM engine (spec #2): daily accrual + monthly capitalisation
         .nest("/api/v1/finance", handlers::finance::finance_routes())
-
         // Interac e-Transfer rails
         .nest("/api/v1/interac", handlers::interac::interac_routes())
         .nest("/api/v1/aft", handlers::aft::aft_routes())
         .nest("/api/v1/lynx", handlers::lynx::lynx_routes())
-
         // Transaction routes
         .nest(
             "/api/v1/transactions",
