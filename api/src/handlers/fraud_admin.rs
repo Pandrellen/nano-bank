@@ -11,14 +11,17 @@
 //!
 //! The API runs zero background workers by design, so the drain is an admin
 //! endpoint poked on a schedule (see `k8s/fraud-denial-drainer-cronjob.yaml`),
-//! the same shape as the Interac notification drainer.
+//! the same shape as the Interac notification drainer — and now literally the
+//! same claim, which both take from [`crate::outbox::OutboxClaim`].
 
 use axum::{extract::State, response::Json, routing::post, Router};
 use uuid::Uuid;
 
+use crate::config::database::DatabasePool;
 use crate::errors::AppError;
 use crate::handlers::AppState;
 use crate::middleware::auth::AuthenticatedService;
+use crate::outbox::OutboxClaim;
 
 /// Attempts before a denial is dead-lettered: left undelivered with its
 /// `last_delivery_error`, and no longer claimed.
@@ -27,9 +30,16 @@ const MAX_DELIVERY_ATTEMPTS: i32 = 5;
 const FLUSH_BATCH: i64 = 100;
 /// Delivered rows are kept this long for debugging, then purged.
 const DELIVERED_RETENTION_DAYS: i32 = 7;
-/// Dead-lettered rows are kept longer: they are evidence that delivery is
-/// broken, and deleting them quickly would hide the outage that caused them.
-const DEAD_LETTER_RETENTION_DAYS: i32 = 30;
+/// Undelivered rows are kept longer, counted from creation and **regardless of
+/// attempt count**. Dead-lettered rows are evidence that delivery is broken and
+/// deleting them quickly would hide the outage; rows that were never attempted
+/// at all (the `backend = "off"` default) are the same problem seen from the
+/// other side. One window covers both, and covers the rows in between — a
+/// partly-attempted row this old means nothing is draining either.
+///
+/// It is longer than the delivered window on purpose: enabling the backend
+/// after a break should find a recent backlog to flush, not a hole.
+const UNDELIVERED_RETENTION_DAYS: i32 = 30;
 
 pub fn fraud_admin_routes() -> Router<AppState> {
     Router::new().route("/admin/flush-denials", post(flush_denials))
@@ -56,6 +66,13 @@ async fn flush_denials(
     State(state): State<AppState>,
     _svc: AuthenticatedService,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Retention runs first, and unconditionally. The table grows fastest in
+    // exactly the configuration that never reaches the delivery loop below —
+    // `backend = "off"` is the default, and every denial still lands in the
+    // outbox — so a purge that only runs when draining is enabled is a purge
+    // that never runs on the deployments that need it.
+    let purged = purge_expired(&state.pool).await?;
+
     // With screening off there is no engine to talk to. Skip without claiming:
     // claiming would burn the retry budget of every row against a backend
     // nobody asked us to call, dead-lettering the lot before it is ever enabled.
@@ -66,20 +83,18 @@ async fn flush_denials(
                 .await?;
         return Ok(Json(serde_json::json!({
             "skipped": pending,
+            "purged": purged,
             "reason": "fraud backend off",
         })));
     }
 
     let claimed = sqlx::query_as::<_, ClaimedDenial>(
-        "UPDATE agent_denial_outbox SET delivery_attempts = delivery_attempts + 1 \
-         WHERE outbox_id IN ( \
-             SELECT outbox_id FROM agent_denial_outbox \
-             WHERE delivered = FALSE AND delivery_attempts < $1 \
-             ORDER BY created_at \
-             LIMIT $2 \
-             FOR UPDATE SKIP LOCKED \
-         ) \
-         RETURNING outbox_id, payload",
+        &OutboxClaim {
+            table: "agent_denial_outbox",
+            id_column: "outbox_id",
+            returning: "outbox_id, payload",
+        }
+        .sql(),
     )
     .bind(MAX_DELIVERY_ATTEMPTS)
     .bind(FLUSH_BATCH)
@@ -120,27 +135,34 @@ async fn flush_denials(
         }
     }
 
-    // Retention. The Interac outbox has no purge and grows forever; this one
-    // must have it, because `backend = "off"` is the default and means rows
-    // accumulate with nothing ever draining them.
-    let purged: u64 = sqlx::query(
-        "DELETE FROM agent_denial_outbox \
-         WHERE (delivered = TRUE \
-                AND delivered_at < CURRENT_TIMESTAMP - ($1 || ' days')::interval) \
-            OR (delivered = FALSE AND delivery_attempts >= $2 \
-                AND created_at < CURRENT_TIMESTAMP - ($3 || ' days')::interval)",
-    )
-    .bind(DELIVERED_RETENTION_DAYS.to_string())
-    .bind(MAX_DELIVERY_ATTEMPTS)
-    .bind(DEAD_LETTER_RETENTION_DAYS.to_string())
-    .execute(&state.pool)
-    .await?
-    .rows_affected();
-
     Ok(Json(serde_json::json!({
         "claimed": claimed_count,
         "delivered": delivered,
         "failed": failed,
         "purged": purged,
     })))
+}
+
+/// Drop outbox rows past their retention window. The Interac outbox has no
+/// purge and grows forever; this one must have it.
+///
+/// Two predicates, split on the only thing that changes the window: whether the
+/// row ever reached the engine. Delivered rows are debugging residue and go
+/// early; undelivered ones are kept the full window from creation whatever
+/// their attempt count, because "never attempted", "mid-retry" and
+/// "dead-lettered" are all the same condition — nothing is draining — and
+/// deserve the same grace period.
+async fn purge_expired(pool: &DatabasePool) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "DELETE FROM agent_denial_outbox \
+         WHERE (delivered = TRUE \
+                AND delivered_at < CURRENT_TIMESTAMP - ($1 || ' days')::interval) \
+            OR (delivered = FALSE \
+                AND created_at < CURRENT_TIMESTAMP - ($2 || ' days')::interval)",
+    )
+    .bind(DELIVERED_RETENTION_DAYS.to_string())
+    .bind(UNDELIVERED_RETENTION_DAYS.to_string())
+    .execute(pool)
+    .await?
+    .rows_affected())
 }

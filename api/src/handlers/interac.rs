@@ -24,6 +24,7 @@ use crate::models::interac::{
     ClaimEtransferRequest, EtransferResponse, HandleResponse, InboundEtransferRequest,
     RegisterAutodepositRequest, SendEtransferRequest, SettleEtransferRequest,
 };
+use crate::outbox::OutboxClaim;
 use crate::rails::common::{recompute_available, zero_available};
 use crate::rails::interac::{ensure_interac_accounts, normalize_handle, InteracRail};
 use crate::rails::{Destination, Rail};
@@ -372,15 +373,12 @@ async fn flush_notifications(
     _svc: AuthenticatedService,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let claimed = sqlx::query_as::<_, ClaimedNotification>(
-        "UPDATE interac_notifications SET delivery_attempts = delivery_attempts + 1 \
-         WHERE notification_id IN ( \
-             SELECT notification_id FROM interac_notifications \
-             WHERE delivered = FALSE AND delivery_attempts < $1 \
-             ORDER BY created_at \
-             LIMIT $2 \
-             FOR UPDATE SKIP LOCKED \
-         ) \
-         RETURNING notification_id, handle_value, kind::text AS kind, message",
+        &OutboxClaim {
+            table: "interac_notifications",
+            id_column: "notification_id",
+            returning: "notification_id, handle_value, kind::text AS kind, message",
+        }
+        .sql(),
     )
     .bind(MAX_DELIVERY_ATTEMPTS)
     .bind(FLUSH_BATCH)

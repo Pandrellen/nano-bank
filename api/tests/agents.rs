@@ -2240,6 +2240,16 @@ async fn denied_transfer_is_mirrored_to_the_outbox() {
     assert_eq!(payload["detail"]["decision"], "denied");
     assert_eq!(payload["detail"]["operation"], "transfer");
     assert!(payload["detail"]["reason"].is_string());
+
+    // Money is a string-decimal on this wire, never a JSON number — the same
+    // convention `/v1/decisions` states out loud in `fraud/engine.rs`. Without
+    // the `::text` cast in the CTE, `jsonb_build_object` emits the DECIMAL as a
+    // bare number and every consumer is one float parse away from losing cents.
+    // Both halves matter: `is_string` is the contract, and the scale is the
+    // proof the cast did not quietly normalise `10.00` down to `10`.
+    let amount = &payload["detail"]["amount"];
+    assert!(amount.is_string(), "amount must be a JSON string: {payload}");
+    assert_eq!(amount, "10.00", "the column's scale must survive the cast");
 }
 
 /// The guard that keeps this telemetry and not a firehose: allowed actions are
@@ -2456,6 +2466,81 @@ async fn flush_denials_is_idempotent_and_skips_when_backend_off() {
         let again: Value = again.json().await.unwrap();
         assert_eq!(again["claimed"], 0, "a delivered row is never re-claimed");
     }
+}
+
+/// Retention is not conditional on delivery being switched on.
+///
+/// This is the case the purge exists for and the one it originally missed:
+/// `backend = "off"` is the default, denials still accumulate, and the drain
+/// returns early long before the DELETE — so on the deployments that grow this
+/// table fastest, nothing ever collected it. The rows are undelivered with zero
+/// attempts, which the old dead-letter predicate (`delivery_attempts >= 5`) did
+/// not match either, so simply moving the DELETE up would not have been enough.
+///
+/// The second, recent row is what makes this test able to fail: a purge that
+/// deleted every undelivered row would satisfy the first assertion happily.
+#[tokio::test]
+async fn retention_purges_abandoned_rows_with_the_backend_off() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // Two out-of-scope reads → two denials → two outbox rows, both undelivered
+    // with zero attempts, exactly as the default configuration leaves them.
+    for _ in 0..2 {
+        assert_eq!(
+            agent_get(&c, &atoken, "/api/v1/agent/transactions")
+                .await
+                .status()
+                .as_u16(),
+            403
+        );
+    }
+    let rows = outbox_rows(&db, mandate).await;
+    assert_eq!(rows.len(), 2, "two denials, two rows: {rows:?}");
+    let (aged, fresh) = (rows[0].0, rows[1].0);
+
+    sqlx::query(
+        "UPDATE agent_denial_outbox SET created_at = CURRENT_TIMESTAMP - INTERVAL '31 days' \
+         WHERE action_id = $1",
+    )
+    .bind(aged)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let svc = admin_service_token(&c).await;
+    let flush = c
+        .post(format!("{}/api/v1/fraud/admin/flush-denials", base_url()))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+    let body: Value = flush.json().await.unwrap();
+    assert!(
+        body["purged"].as_u64().unwrap_or(0) >= 1,
+        "the flush must report what it collected, backend off or not: {body}"
+    );
+
+    let survivors: Vec<Uuid> = outbox_rows(&db, mandate)
+        .await
+        .into_iter()
+        .map(|(action_id, _, _)| action_id)
+        .collect();
+    assert!(
+        !survivors.contains(&aged),
+        "a 31-day-old undelivered row is past its window: {survivors:?}"
+    );
+    assert!(
+        survivors.contains(&fresh),
+        "a row created seconds ago must not be swept up with it: {survivors:?}"
+    );
 }
 
 /// Mint a network/admin-plane service token — same path the drainer CronJob uses.

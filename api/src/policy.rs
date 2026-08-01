@@ -64,6 +64,12 @@ pub fn decision_for(reason: &str) -> &'static str {
 /// `decision <> 'allowed'` deliberately includes `step_up_required`: the cap
 /// overruns are exactly the balance/limit bisection worth seeing. The real
 /// decision travels in the payload so the engine can separate them later.
+///
+/// `amount::text` is not cosmetic: `jsonb_build_object` on a `DECIMAL(15,2)`
+/// emits a bare JSON number, and money never crosses this wire as one — the
+/// decision path already sends string-decimals (`fraud/engine.rs`), and the
+/// outcomes path has to agree. The cast preserves scale (`900.00`), and reads,
+/// which carry no amount, stay `null`.
 const ACTION_INSERT_SQL: &str = "WITH a AS ( \
      INSERT INTO agent_actions \
      (mandate_id, agent_id, customer_id, account_id, operation, amount, \
@@ -85,7 +91,7 @@ const ACTION_INSERT_SQL: &str = "WITH a AS ( \
                   'decision', decision, \
                   'reason', reason, \
                   'operation', operation, \
-                  'amount', amount, \
+                  'amount', amount::text, \
                   'mandate_id', mandate_id, \
                   'agent_id', agent_id)) \
      FROM a \
