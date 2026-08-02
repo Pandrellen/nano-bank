@@ -37,13 +37,17 @@ pub fn interac_routes() -> Router<AppState> {
         .route("/etransfers/:id/claim", post(claim_etransfer))
         .route("/etransfers/:id/decline", post(decline_etransfer))
         .route("/etransfers/:id/cancel", post(cancel_etransfer))
-        .route("/autodeposit", post(register_autodeposit).get(list_autodeposit))
+        .route(
+            "/autodeposit",
+            post(register_autodeposit).get(list_autodeposit),
+        )
         .route("/autodeposit/:id", delete(deregister_autodeposit))
         // network plane (service token)
         .route("/network/inbound", post(network_inbound))
         .route("/network/etransfers/:id/settle", post(network_settle))
         // admin plane (service token)
         .route("/admin/sweep-expired", post(sweep_expired))
+        .route("/admin/flush-notifications", post(flush_notifications))
 }
 
 /// Resolve Interac's clearing/settlement accounts (re-resolved per request) and
@@ -81,12 +85,37 @@ async fn send_etransfer(
     let recipient_handle = normalize_handle(req.recipient_handle_type, &req.recipient_handle_value);
     let rail = resolve_interac(&state).await?;
 
-    // Idempotency replay: same (sender, key) returns the original.
+    // Idempotency replay: same (sender, key) returns the original. Checked
+    // BEFORE screening so a replayed retry returns the cached result without
+    // re-invoking the fraud engine (no double velocity-count, no spurious
+    // fail-closed on an already-sent e-Transfer).
     if let Some(key) = &req.idempotency_key {
         if let Some(existing) = load_etransfer_by_key(&state, caller.customer_id, key).await? {
             return Ok((StatusCode::CREATED, Json(existing)));
         }
     }
+
+    let fraud_link = crate::fraud::gate::screen(
+        &state,
+        crate::fraud::gate::ScreenInput {
+            kind: "interac_etransfer",
+            amount,
+            customer_id: caller.customer_id,
+            from_account_id: req.from_account_id,
+            to_account_id: None,
+            payee_handle: Some(&recipient_handle),
+            description: req.memo.as_deref(),
+            external_reference: None,
+            merchant: None,
+            idempotency_key: req.idempotency_key.as_deref(),
+            channel: "web",
+            session_id: caller.session_id,
+            agent: None,
+        },
+    )
+    .await?;
+    // fraud_link is settled after the send commits below (metadata linkage
+    // lives in the engine's decision log; rails keep their own rows).
 
     // Look up whether the recipient handle is registered here, and autodeposit.
     let registration = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
@@ -240,6 +269,8 @@ async fn send_etransfer(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
     tracing::info!(%etransfer_id, status, "📨 e-Transfer sent");
     Ok((
         StatusCode::CREATED,
@@ -286,6 +317,115 @@ async fn notify(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Notification-outbox drainer (admin plane)
+// ---------------------------------------------------------------------------
+
+/// Attempts before a notification is dead-lettered: left undelivered with its
+/// `last_delivery_error`, and no longer picked up by the drainer.
+const MAX_DELIVERY_ATTEMPTS: i32 = 5;
+/// Rows claimed per flush — bounds one admin call's work.
+const FLUSH_BATCH: i64 = 100;
+
+/// A claimed outbox row, ready to hand to the delivery channel.
+#[derive(sqlx::FromRow)]
+struct ClaimedNotification {
+    notification_id: Uuid,
+    handle_value: String,
+    kind: String,
+    message: String,
+}
+
+/// The delivery-channel seam. Today it just logs — this is where a real email/SMS
+/// provider plugs in. Returns `Err(reason)` on a delivery failure so the drainer
+/// records it and retries (up to the attempt cap).
+///
+/// **Delivery is at-least-once.** The claim, the send, and the `delivered = TRUE`
+/// mark are three separate statements, so a crash (or a failed mark) after a
+/// successful send re-delivers on the next tick. That is invisible while this is a
+/// stub, but a real provider must dedupe: pass `notification_id` as the
+/// provider-side **idempotency key** so a retry collapses into the original send
+/// instead of a second "your e-Transfer arrived" message.
+async fn deliver_notification(n: &ClaimedNotification) -> Result<(), String> {
+    tracing::info!(
+        notification_id = %n.notification_id,
+        handle = %n.handle_value,
+        kind = %n.kind,
+        "📣 interac notification delivered (stub): {}",
+        n.message
+    );
+    Ok(())
+}
+
+/// Drain the Interac notification outbox (admin plane, service token).
+///
+/// The claim is an atomic `delivery_attempts += 1` under `FOR UPDATE SKIP LOCKED`,
+/// so concurrent drainers (or multiple API replicas) never grab the same row, and
+/// there is no in-flight "sending" state to strand on a crash: a claim that dies
+/// mid-send just costs one attempt and is retried next flush. Rows past
+/// `MAX_DELIVERY_ATTEMPTS` are skipped (dead-lettered, visible via
+/// `last_delivery_error`) instead of retried forever.
+async fn flush_notifications(
+    State(state): State<AppState>,
+    _svc: AuthenticatedService,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let claimed = sqlx::query_as::<_, ClaimedNotification>(
+        "UPDATE interac_notifications SET delivery_attempts = delivery_attempts + 1 \
+         WHERE notification_id IN ( \
+             SELECT notification_id FROM interac_notifications \
+             WHERE delivered = FALSE AND delivery_attempts < $1 \
+             ORDER BY created_at \
+             LIMIT $2 \
+             FOR UPDATE SKIP LOCKED \
+         ) \
+         RETURNING notification_id, handle_value, kind::text AS kind, message",
+    )
+    .bind(MAX_DELIVERY_ATTEMPTS)
+    .bind(FLUSH_BATCH)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let claimed_count = claimed.len() as i64;
+    let mut delivered = 0i64;
+    let mut failed = 0i64;
+
+    for n in claimed {
+        match deliver_notification(&n).await {
+            Ok(()) => {
+                sqlx::query(
+                    "UPDATE interac_notifications \
+                     SET delivered = TRUE, delivered_at = CURRENT_TIMESTAMP, \
+                         last_delivery_error = NULL \
+                     WHERE notification_id = $1",
+                )
+                .bind(n.notification_id)
+                .execute(&state.pool)
+                .await?;
+                delivered += 1;
+            }
+            Err(reason) => {
+                // Leave delivered = FALSE (the attempt is already counted): it
+                // retries next flush until the budget is spent, then dead-letters.
+                sqlx::query(
+                    "UPDATE interac_notifications SET last_delivery_error = $2 \
+                     WHERE notification_id = $1",
+                )
+                .bind(n.notification_id)
+                .bind(&reason)
+                .execute(&state.pool)
+                .await?;
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "claimed": claimed_count,
+        "delivered": delivered,
+        "failed": failed,
+    })))
 }
 
 fn idempotency_conflict(e: sqlx::Error) -> AppError {
@@ -354,20 +494,45 @@ async fn list_etransfers(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Vec<EtransferResponse>>, AppError> {
     let status = params.get("status").cloned();
-    let rows = sqlx::query_as::<_, (Uuid, String, String, Decimal, String, Option<String>, Option<String>,
-        Option<chrono::DateTime<chrono::Utc>>, chrono::DateTime<chrono::Utc>)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            String,
+            String,
+            Decimal,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<chrono::DateTime<chrono::Utc>>,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
         "SELECT etransfer_id, direction::text, status::text, amount, recipient_handle_value, \
          security_question, memo, expires_at, created_at FROM interac_etransfers \
          WHERE (sender_customer_id=$1 OR recipient_customer_id=$1) \
            AND ($2::text IS NULL OR status::text=$2) \
          ORDER BY created_at DESC LIMIT 100",
     )
-    .bind(caller.customer_id).bind(&status)
-    .fetch_all(&state.pool).await?;
-    Ok(Json(rows.into_iter().map(|r| EtransferResponse {
-        etransfer_id: r.0, direction: r.1, status: r.2, amount: r.3,
-        recipient_handle_value: r.4, security_question: r.5, memo: r.6, expires_at: r.7, created_at: r.8,
-    }).collect()))
+    .bind(caller.customer_id)
+    .bind(&status)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| EtransferResponse {
+                etransfer_id: r.0,
+                direction: r.1,
+                status: r.2,
+                amount: r.3,
+                recipient_handle_value: r.4,
+                security_question: r.5,
+                memo: r.6,
+                expires_at: r.7,
+                created_at: r.8,
+            })
+            .collect(),
+    ))
 }
 
 async fn get_etransfer(
@@ -377,9 +542,15 @@ async fn get_etransfer(
 ) -> Result<Json<EtransferResponse>, AppError> {
     let visible: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM interac_etransfers WHERE etransfer_id=$1 \
-         AND (sender_customer_id=$2 OR recipient_customer_id=$2))")
-        .bind(id).bind(caller.customer_id).fetch_one(&state.pool).await?;
-    if !visible { return Err(AppError::NotFound("e-Transfer not found".into())); }
+         AND (sender_customer_id=$2 OR recipient_customer_id=$2))",
+    )
+    .bind(id)
+    .bind(caller.customer_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if !visible {
+        return Err(AppError::NotFound("e-Transfer not found".into()));
+    }
     Ok(Json(load_etransfer(&state, id).await?))
 }
 
@@ -388,7 +559,17 @@ async fn get_etransfer(
 async fn lock_available(
     tx: &mut crate::rails::PgTx<'_>,
     id: Uuid,
-) -> Result<(Decimal, Option<Uuid>, Option<Uuid>, Option<String>, i32, String), AppError> {
+) -> Result<
+    (
+        Decimal,
+        Option<Uuid>,
+        Option<Uuid>,
+        Option<String>,
+        i32,
+        String,
+    ),
+    AppError,
+> {
     let row = sqlx::query_as::<_, (String, Decimal, Option<Uuid>, Option<Uuid>, Option<String>, i32, String)>(
         "SELECT status::text, amount, sender_account_id, recipient_customer_id, \
          security_answer_hash, wrong_answer_attempts, \
@@ -440,8 +621,13 @@ async fn claim_etransfer(
                     "too many incorrect answers; e-Transfer locked".into(),
                 ));
             }
-            sqlx::query("UPDATE interac_etransfers SET wrong_answer_attempts=$2 WHERE etransfer_id=$1")
-                .bind(id).bind(n).execute(&mut *tx).await?;
+            sqlx::query(
+                "UPDATE interac_etransfers SET wrong_answer_attempts=$2 WHERE etransfer_id=$1",
+            )
+            .bind(id)
+            .bind(n)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Err(AppError::BadRequest("incorrect security answer".into()));
         }
@@ -477,11 +663,12 @@ async fn claim_etransfer(
     .bind(caller.customer_id)
     .execute(&mut *tx)
     .await?;
-    let handle: String =
-        sqlx::query_scalar("SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let handle: String = sqlx::query_scalar(
+        "SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     notify(
         &mut tx,
         id,
@@ -508,9 +695,12 @@ async fn decline_etransfer(
     // recipient_customer_id; external-routed transfers leave it NULL, so a
     // non-recipient (or the wrong customer) gets 404, not 403.
     let recipient: Option<Uuid> = sqlx::query_scalar(
-        "SELECT recipient_customer_id FROM interac_etransfers WHERE etransfer_id=$1 FOR UPDATE")
-        .bind(id).fetch_optional(&mut *tx).await?
-        .ok_or_else(|| AppError::NotFound("e-Transfer not found".into()))?;
+        "SELECT recipient_customer_id FROM interac_etransfers WHERE etransfer_id=$1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("e-Transfer not found".into()))?;
     if recipient != Some(caller.customer_id) {
         return Err(AppError::NotFound("e-Transfer not found".into())); // 404, not 403
     }
@@ -526,23 +716,26 @@ async fn decline_etransfer(
         reference: hold_ref,
         transaction_id: Uuid::nil(),
     };
-    rail.refund(&state, &mut tx, &hold, "Interac e-Transfer declined").await?;
+    rail.refund(&state, &mut tx, &hold, "Interac e-Transfer declined")
+        .await?;
     // Sender was just credited back (refund); refresh its available_balance too —
     // but only for a real CUSTOMER account. For inbound declines the "sender" is
     // remapped above to the rail's SETTLEMENT system account, which must keep
     // available_balance pinned at 0 (see rails/interac.rs invariant); recomputing
     // it here would pin it to balance+overdraft and later trip
     // chk_available_balance_logical when settlement is next debited.
-    if sender_account != rail.accounts.settlement_id && sender_account != rail.accounts.clearing_id {
+    if sender_account != rail.accounts.settlement_id && sender_account != rail.accounts.clearing_id
+    {
         recompute_available(&mut tx, sender_account).await?;
     }
     sqlx::query("UPDATE interac_etransfers SET status='declined', resolved_at=CURRENT_TIMESTAMP WHERE etransfer_id=$1")
         .bind(id).execute(&mut *tx).await?;
-    let handle: String =
-        sqlx::query_scalar("SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
+    let handle: String = sqlx::query_scalar(
+        "SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
     notify(
         &mut tx,
         id,
@@ -566,9 +759,12 @@ async fn cancel_etransfer(
 
     // Ownership check folded into the lock: only the sender may cancel.
     let sender: Option<Uuid> = sqlx::query_scalar(
-        "SELECT sender_customer_id FROM interac_etransfers WHERE etransfer_id=$1 FOR UPDATE")
-        .bind(id).fetch_optional(&mut *tx).await?
-        .ok_or_else(|| AppError::NotFound("e-Transfer not found".into()))?;
+        "SELECT sender_customer_id FROM interac_etransfers WHERE etransfer_id=$1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::NotFound("e-Transfer not found".into()))?;
     if sender != Some(caller.customer_id) {
         return Err(AppError::NotFound("e-Transfer not found".into())); // 404, not 403
     }
@@ -576,15 +772,33 @@ async fn cancel_etransfer(
     // Cancel is outbound-only, so sender_account is always Some; fall back to
     // settlement defensively.
     let sender_account = sender_account.unwrap_or(rail.accounts.settlement_id);
-    let hold = crate::rails::Hold { from_account: sender_account, amount, reference: hold_ref, transaction_id: Uuid::nil() };
-    rail.refund(&state, &mut tx, &hold, "Interac e-Transfer cancelled").await?;
+    let hold = crate::rails::Hold {
+        from_account: sender_account,
+        amount,
+        reference: hold_ref,
+        transaction_id: Uuid::nil(),
+    };
+    rail.refund(&state, &mut tx, &hold, "Interac e-Transfer cancelled")
+        .await?;
     // Sender was just credited back (refund); refresh its available_balance too.
     recompute_available(&mut tx, sender_account).await?;
     sqlx::query("UPDATE interac_etransfers SET status='cancelled', resolved_at=CURRENT_TIMESTAMP WHERE etransfer_id=$1")
         .bind(id).execute(&mut *tx).await?;
-    let handle: String = sqlx::query_scalar("SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1")
-        .bind(id).fetch_one(&mut *tx).await?;
-    notify(&mut tx, id, &handle, "cancelled", &format!("${amount} transfer was cancelled"), None).await?;
+    let handle: String = sqlx::query_scalar(
+        "SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    notify(
+        &mut tx,
+        id,
+        &handle,
+        "cancelled",
+        &format!("${amount} transfer was cancelled"),
+        None,
+    )
+    .await?;
     tx.commit().await?;
     Ok((StatusCode::OK, Json(load_etransfer(&state, id).await?)))
 }
@@ -644,7 +858,16 @@ async fn list_autodeposit(
     State(state): State<AppState>,
     caller: AuthenticatedCustomer,
 ) -> Result<Json<Vec<HandleResponse>>, AppError> {
-    let rows = sqlx::query_as::<_, (Uuid, crate::models::interac::HandleType, String, Option<Uuid>, bool)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            crate::models::interac::HandleType,
+            String,
+            Option<Uuid>,
+            bool,
+        ),
+    >(
         "SELECT handle_id, handle_type, handle_value, autodeposit_account_id, active \
          FROM interac_handles WHERE customer_id=$1 ORDER BY created_at",
     )
@@ -654,8 +877,11 @@ async fn list_autodeposit(
     Ok(Json(
         rows.into_iter()
             .map(|(id, ht, hv, ad, active)| HandleResponse {
-                handle_id: id, handle_type: ht, handle_value: hv,
-                autodeposit_account_id: ad, active,
+                handle_id: id,
+                handle_type: ht,
+                handle_value: hv,
+                autodeposit_account_id: ad,
+                active,
             })
             .collect(),
     ))
@@ -702,35 +928,96 @@ async fn network_inbound(
 
     if let Some(deposit_acct) = reg.1 {
         // Autodeposit fast path.
-        let posting = rail.accept_inbound(&state, &mut tx, deposit_acct, amount,
-            &format!("Interac e-Transfer from {}", req.sender_name)).await?;
-        let id = insert_inbound(&mut tx, amount, &req, &handle, reg.0, &claim_token,
-            None, Some(deposit_acct), Some(posting.transaction_id), "deposited",
-            expiry_days(&state)).await?;
+        let posting = rail
+            .accept_inbound(
+                &state,
+                &mut tx,
+                deposit_acct,
+                amount,
+                &format!("Interac e-Transfer from {}", req.sender_name),
+            )
+            .await?;
+        let id = insert_inbound(
+            &mut tx,
+            amount,
+            &req,
+            &handle,
+            reg.0,
+            &claim_token,
+            None,
+            Some(deposit_acct),
+            Some(posting.transaction_id),
+            "deposited",
+            expiry_days(&state),
+        )
+        .await?;
         recompute_available(&mut tx, deposit_acct).await?;
-        notify(&mut tx, id, &handle, "deposit_completed", &format!("${amount} auto-deposited"), None).await?;
+        notify(
+            &mut tx,
+            id,
+            &handle,
+            "deposit_completed",
+            &format!("${amount} auto-deposited"),
+            None,
+        )
+        .await?;
         tx.commit().await?;
         return Ok((StatusCode::CREATED, Json(load_etransfer(&state, id).await?)));
     }
 
     // Held path: money arrives from the network into clearing (from = SETTLEMENT).
-    let hold = rail.hold(&state, &mut tx, rail.accounts.settlement_id, amount,
-        &format!("Interac inbound e-Transfer from {}", req.sender_name)).await?;
-    let id = insert_inbound(&mut tx, amount, &req, &handle, reg.0, &claim_token,
-        answer_hash, None, Some(hold.transaction_id), "available",
-        expiry_days(&state)).await?;
-    notify(&mut tx, id, &handle, "incoming_transfer",
-        &format!("You have an Interac e-Transfer of ${amount} from {}", req.sender_name), Some(&claim_token)).await?;
+    let hold = rail
+        .hold(
+            &state,
+            &mut tx,
+            rail.accounts.settlement_id,
+            amount,
+            &format!("Interac inbound e-Transfer from {}", req.sender_name),
+        )
+        .await?;
+    let id = insert_inbound(
+        &mut tx,
+        amount,
+        &req,
+        &handle,
+        reg.0,
+        &claim_token,
+        answer_hash,
+        None,
+        Some(hold.transaction_id),
+        "available",
+        expiry_days(&state),
+    )
+    .await?;
+    notify(
+        &mut tx,
+        id,
+        &handle,
+        "incoming_transfer",
+        &format!(
+            "You have an Interac e-Transfer of ${amount} from {}",
+            req.sender_name
+        ),
+        Some(&claim_token),
+    )
+    .await?;
     tx.commit().await?;
     Ok((StatusCode::CREATED, Json(load_etransfer(&state, id).await?)))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_inbound(
-    tx: &mut crate::rails::PgTx<'_>, amount: Decimal, req: &InboundEtransferRequest,
-    handle: &str, recipient_customer: Uuid, claim_token: &str,
-    answer_hash: Option<String>, recipient_account: Option<Uuid>,
-    hold_txn: Option<Uuid>, status: &str, expiry_days: i64,
+    tx: &mut crate::rails::PgTx<'_>,
+    amount: Decimal,
+    req: &InboundEtransferRequest,
+    handle: &str,
+    recipient_customer: Uuid,
+    claim_token: &str,
+    answer_hash: Option<String>,
+    recipient_account: Option<Uuid>,
+    hold_txn: Option<Uuid>,
+    status: &str,
+    expiry_days: i64,
 ) -> Result<Uuid, AppError> {
     let id: Uuid = sqlx::query_scalar(
         r#"
@@ -767,25 +1054,49 @@ async fn network_settle(
          FROM interac_etransfers WHERE etransfer_id=$1 FOR UPDATE")
         .bind(id).fetch_optional(&mut *tx).await?
         .ok_or_else(|| AppError::NotFound("e-Transfer not found".into()))?;
-    if row.0 != "available" { return Err(AppError::Conflict(format!("e-Transfer is {}", row.0))); }
+    if row.0 != "available" {
+        return Err(AppError::Conflict(format!("e-Transfer is {}", row.0)));
+    }
     if row.1 != "outbound" || row.4.is_some() {
-        return Err(AppError::BadRequest("not an external outbound transfer".into()));
+        return Err(AppError::BadRequest(
+            "not an external outbound transfer".into(),
+        ));
     }
     let hold = crate::rails::Hold {
-        from_account: row.3.ok_or_else(|| AppError::Internal("missing sender account".into()))?,
-        amount: row.2, reference: row.5, transaction_id: Uuid::nil(),
+        from_account: row
+            .3
+            .ok_or_else(|| AppError::Internal("missing sender account".into()))?,
+        amount: row.2,
+        reference: row.5,
+        transaction_id: Uuid::nil(),
     };
 
     let (new_status, handle_kind, msg) = match req.outcome.as_str() {
         "claimed" => {
-            rail.release(&state, &mut tx, &hold, crate::rails::Destination::External(req.institution.clone()),
-                "Interac e-Transfer settled to external bank").await?;
+            rail.release(
+                &state,
+                &mut tx,
+                &hold,
+                crate::rails::Destination::External(req.institution.clone()),
+                "Interac e-Transfer settled to external bank",
+            )
+            .await?;
             sqlx::query("UPDATE interac_etransfers SET status='deposited', counterparty_institution=$2, resolved_at=CURRENT_TIMESTAMP WHERE etransfer_id=$1")
                 .bind(id).bind(&req.institution).execute(&mut *tx).await?;
-            ("deposited", "deposit_completed", "deposited at the recipient's bank")
+            (
+                "deposited",
+                "deposit_completed",
+                "deposited at the recipient's bank",
+            )
         }
         "declined" => {
-            rail.refund(&state, &mut tx, &hold, "Interac e-Transfer declined by network").await?;
+            rail.refund(
+                &state,
+                &mut tx,
+                &hold,
+                "Interac e-Transfer declined by network",
+            )
+            .await?;
             sqlx::query("UPDATE interac_etransfers SET status='declined', resolved_at=CURRENT_TIMESTAMP WHERE etransfer_id=$1")
                 .bind(id).execute(&mut *tx).await?;
             // Sender was just credited back (refund); refresh its available_balance too.
@@ -795,9 +1106,21 @@ async fn network_settle(
         other => return Err(AppError::BadRequest(format!("unknown outcome '{other}'"))),
     };
 
-    let handle: String = sqlx::query_scalar("SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1")
-        .bind(id).fetch_one(&mut *tx).await?;
-    notify(&mut tx, id, &handle, handle_kind, &format!("Your e-Transfer was {msg}"), None).await?;
+    let handle: String = sqlx::query_scalar(
+        "SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    notify(
+        &mut tx,
+        id,
+        &handle,
+        handle_kind,
+        &format!("Your e-Transfer was {msg}"),
+        None,
+    )
+    .await?;
     let _ = new_status;
     tx.commit().await?;
     Ok((StatusCode::OK, Json(load_etransfer(&state, id).await?)))
@@ -811,8 +1134,10 @@ async fn sweep_expired(
     // one bad row can't roll back the batch.
     let due: Vec<Uuid> = sqlx::query_scalar(
         "SELECT etransfer_id FROM interac_etransfers \
-         WHERE status='available' AND expires_at < CURRENT_TIMESTAMP")
-        .fetch_all(&state.pool).await?;
+         WHERE status='available' AND expires_at < CURRENT_TIMESTAMP",
+    )
+    .fetch_all(&state.pool)
+    .await?;
 
     let mut expired = 0i64;
     for id in due {
@@ -821,26 +1146,48 @@ async fn sweep_expired(
         let guard = lock_available(&mut tx, id).await;
         let (amount, from_account, _r, _h, _a, hold_ref) = match guard {
             Ok(v) => v,
-            Err(_) => { tx.rollback().await?; continue; }
+            Err(_) => {
+                tx.rollback().await?;
+                continue;
+            }
         };
         // Inbound held transfers have no sender_account_id (None); those were
         // held from the rail's SETTLEMENT account (network → clearing), so
         // that's where the refund must be credited back.
         let from_account = from_account.unwrap_or(rail.accounts.settlement_id);
-        let hold = crate::rails::Hold { from_account, amount, reference: hold_ref, transaction_id: Uuid::nil() };
-        rail.refund(&state, &mut tx, &hold, "Interac e-Transfer expired").await?;
+        let hold = crate::rails::Hold {
+            from_account,
+            amount,
+            reference: hold_ref,
+            transaction_id: Uuid::nil(),
+        };
+        rail.refund(&state, &mut tx, &hold, "Interac e-Transfer expired")
+            .await?;
         // Only recompute for a real CUSTOMER account; skip for the rail's own
         // SETTLEMENT/CLEARING accounts (inbound held transfers), whose
         // available_balance must stay pinned at 0 (see decline_etransfer above
         // for the full rationale).
-        if from_account != rail.accounts.settlement_id && from_account != rail.accounts.clearing_id {
+        if from_account != rail.accounts.settlement_id && from_account != rail.accounts.clearing_id
+        {
             recompute_available(&mut tx, from_account).await?;
         }
         sqlx::query("UPDATE interac_etransfers SET status='expired', resolved_at=CURRENT_TIMESTAMP WHERE etransfer_id=$1")
             .bind(id).execute(&mut *tx).await?;
-        let handle: String = sqlx::query_scalar("SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1")
-            .bind(id).fetch_one(&mut *tx).await?;
-        notify(&mut tx, id, &handle, "expired", &format!("${amount} expired and was returned"), None).await?;
+        let handle: String = sqlx::query_scalar(
+            "SELECT recipient_handle_value FROM interac_etransfers WHERE etransfer_id=$1",
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
+        notify(
+            &mut tx,
+            id,
+            &handle,
+            "expired",
+            &format!("${amount} expired and was returned"),
+            None,
+        )
+        .await?;
         tx.commit().await?;
         expired += 1;
     }

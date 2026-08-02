@@ -165,10 +165,12 @@ async fn post_mandated_transfer(
     }
 
     // Step-up retry (Phase 3): the same request may already be parked awaiting
-    // the owner's decision — hand back the same open ask, don't stack another.
+    // the owner's decision — or being executed right now — hand back the same
+    // OPEN ask (pending or executing), don't stack another.
     if let Some(open) = sqlx::query_as::<_, AgentApprovalStatus>(&format!(
         "SELECT {AGENT_APPROVAL_COLUMNS} FROM pending_approvals \
-         WHERE mandate_id = $1 AND idempotency_key = $2 AND status = 'pending' \
+         WHERE mandate_id = $1 AND idempotency_key = $2 \
+           AND status IN ('pending', 'executing') \
            AND expires_at > CURRENT_TIMESTAMP",
     ))
     .bind(agent.mandate_id)
@@ -195,6 +197,12 @@ async fn post_mandated_transfer(
                 mandate_id: agent.mandate_id,
                 cap_override: false,
             }),
+        },
+        crate::fraud::gate::Screening {
+            channel: "web", // overridden to agentic_branch by the agent ctx
+            session_id: None,
+            approval_latency_seconds: None,
+            screen_scope: None,
         },
     )
     .await;
@@ -231,8 +239,50 @@ async fn post_mandated_transfer(
                 let approval = park_pending_approval(&state, &agent, &req, amount, &reason).await?;
                 return Ok((StatusCode::ACCEPTED, Json(approval)).into_response());
             }
-            Err(err)
+            // The audit above kept the true reason; the agent gets one opaque
+            // refusal, because a cause-specific one is an oracle (see
+            // refusal_for_agent).
+            Err(refusal_for_agent(err))
         }
+    }
+}
+
+/// Collapse a refusal into what an automated client may learn.
+///
+/// Distinguishable refusals are an oracle: because the mandate's policy is
+/// evaluated before account state — and a failed attempt rolls back, consuming no
+/// cap — an agent holding only `transfer:initiate` could tell a nonexistent
+/// destination from a frozen one from a closed one from a credit card from one
+/// with insufficient funds, enumerate which accounts its own `allowed_payees`
+/// covers, and bisect its funding account's balance without ever being granted
+/// `read:balance`. Card networks collapse risk declines onto one generic code for
+/// exactly this reason.
+///
+/// Three buckets, so the API stays usable:
+/// - the agent's own malformed request stays specific (it must be fixable),
+/// - transient failures stay distinguishable (or clients retry blindly),
+/// - every refusal becomes one opaque code.
+///
+/// Nothing is lost: `agent_actions` still carries the true reason for the
+/// granting customer, who is the party entitled to it.
+pub(crate) fn refusal_for_agent(err: AppError) -> AppError {
+    match err {
+        // The agent's own bug — keep it debuggable.
+        AppError::Validation(_) | AppError::BadRequest(_) => err,
+        // Transient: the agent should back off and retry, so it must be able to
+        // tell these apart from a refusal.
+        AppError::ServiceUnavailable(_)
+        | AppError::RateLimit(_)
+        | AppError::Upstream { .. }
+        | AppError::Database(_)
+        | AppError::Internal(_) => err,
+        // Its own credential died — it cannot act on anything else, and hiding
+        // this would just make it retry forever.
+        AppError::MandateInactive => err,
+        // Everything else refused this transfer, and why is not the agent's
+        // business: funds, account existence, account status, account limits,
+        // payee allowlist, missing scope, risk.
+        _ => AppError::TransferRefused,
     }
 }
 
@@ -248,6 +298,13 @@ pub(crate) fn transfer_failure_reason(err: &AppError) -> String {
         AppError::BadRequest(_) => "BAD_REQUEST".to_string(),
         AppError::NotFound(_) => "NOT_FOUND".to_string(),
         AppError::TransactionLimitExceeded => "ACCOUNT_LIMIT_EXCEEDED".to_string(),
+        // Fraud-engine refusals. Without these arms they audited as INTERNAL,
+        // which told the owner nothing — and, next to the gate's own row, told it
+        // twice and inconsistently. The engine's reason codes still never leave
+        // the engine; these are the bank's own coarse categories.
+        AppError::TransactionDeclined => "RISK_DECLINED".to_string(),
+        AppError::TransactionUnderReview(_) => "RISK_REVIEW".to_string(),
+        AppError::ServiceUnavailable(_) => "RISK_UNAVAILABLE".to_string(),
         _ => "INTERNAL".to_string(),
     }
 }
@@ -269,7 +326,8 @@ async fn park_pending_approval(
           description, idempotency_key, reason, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                  CURRENT_TIMESTAMP + $10 * INTERVAL '1 minute') \
-         ON CONFLICT (mandate_id, idempotency_key) WHERE status = 'pending' DO NOTHING \
+         ON CONFLICT (mandate_id, idempotency_key) \
+         WHERE status IN ('pending', 'executing') DO NOTHING \
          RETURNING {AGENT_APPROVAL_COLUMNS}",
     ))
     .bind(agent.mandate_id)
@@ -290,10 +348,13 @@ async fn park_pending_approval(
             %amount, reason, "⏸ transfer parked for step-up approval");
         return Ok(created);
     }
-    // Lost a tight race: the concurrent duplicate already parked this ask.
+    // Lost a tight race: the same ask is already open (parked by a concurrent
+    // duplicate, or mid-execution). No expiry filter here — this is the safety
+    // net after an insert conflict, so return whatever open ask exists.
     sqlx::query_as::<_, AgentApprovalStatus>(&format!(
         "SELECT {AGENT_APPROVAL_COLUMNS} FROM pending_approvals \
-         WHERE mandate_id = $1 AND idempotency_key = $2 AND status = 'pending'",
+         WHERE mandate_id = $1 AND idempotency_key = $2 \
+           AND status IN ('pending', 'executing')",
     ))
     .bind(agent.mandate_id)
     .bind(&req.idempotency_key)
@@ -310,16 +371,21 @@ async fn get_approval_status(
     agent: AuthenticatedAgent,
     Path(approval_id): Path<Uuid>,
 ) -> Result<Json<AgentApprovalStatus>, AppError> {
-    // Lazy expiry, same idiom as the customer surface.
-    sqlx::query(
-        "UPDATE pending_approvals \
-         SET status = 'expired', resolved_at = CURRENT_TIMESTAMP \
-         WHERE approval_id = $1 AND status = 'pending' AND expires_at <= CURRENT_TIMESTAMP",
+    // Lazy reclaim-then-expire — the agent polling is the other liveness path
+    // (an abandoned claim must become actionable even if the customer never
+    // opens /app). Through the customer plane's helper, not a copy: this used
+    // to be two inline UPDATEs here, and the expiry one wrote no audit at all,
+    // so an agent that polled first destroyed the ask's ending. Scoped to the
+    // polling mandate too — this handler must not write a row it may not read.
+    crate::handlers::approvals::reclaim_and_expire(
+        &state.pool,
+        crate::handlers::approvals::ExpiryScope::Ask {
+            customer_id: agent.customer_id,
+            mandate_id: agent.mandate_id,
+            approval_id,
+        },
     )
-    .bind(approval_id)
-    .execute(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
+    .await?;
 
     let approval = sqlx::query_as::<_, AgentApprovalStatus>(&format!(
         "SELECT {AGENT_APPROVAL_COLUMNS} FROM pending_approvals \

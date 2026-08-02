@@ -23,8 +23,14 @@ CREATE TABLE agents (
     -- Global kill switch for a compromised agent (checked on every request).
     status       VARCHAR(20) NOT NULL DEFAULT 'active'
                  CHECK (status IN ('active', 'disabled')),
+    -- Source address of the registration. Registration is unauthenticated, so
+    -- this is what the per-address throttle counts (handlers/agents.rs), and it
+    -- is the provenance if a flood ever has to be traced.
+    registered_ip INET,
     created_at   TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
+CREATE INDEX idx_agents_registered_ip ON agents (registered_ip, created_at)
+    WHERE registered_ip IS NOT NULL;
 
 -- The consent record — the single source of truth for what an agent may do.
 -- Scopes/limits deliberately do NOT live in the agent JWT.
@@ -105,16 +111,27 @@ CREATE TABLE pending_approvals (
     idempotency_key VARCHAR(128) NOT NULL,
     -- Which cap tripped: 'MAX_PER_TX_EXCEEDED' | 'DAILY_CAP_EXCEEDED'
     reason          TEXT NOT NULL,
+    -- 'executing' is the transient claim state while the approved transfer
+    -- posts: 'approved' is only ever written together with transaction_id, so
+    -- an agent polling can treat approved as final (never approved-with-no-txn).
     status          VARCHAR(20) NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'approved', 'declined', 'expired')),
+                    CHECK (status IN ('pending', 'executing', 'approved', 'declined', 'expired')),
     transaction_id  UUID, -- the executed transfer (approved only)
+    -- Lease marker for the 'executing' claim: a crash mid-execution leaves the
+    -- row claimable again once claimed_at ages past the reclaim window (the
+    -- approve path finalizes by idempotency key, so re-approve can't double-pay).
+    claimed_at      TIMESTAMP WITH TIME ZONE,
     created_at      TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
     expires_at      TIMESTAMP WITH TIME ZONE NOT NULL,
     resolved_at     TIMESTAMP WITH TIME ZONE
 );
 
 -- An agent retry of the same request (mandate + idempotency key) maps onto the
--- same open ask instead of stacking duplicates.
-CREATE UNIQUE INDEX idx_pending_approvals_open_key
-    ON pending_approvals(mandate_id, idempotency_key) WHERE status = 'pending';
+-- same OPEN ask instead of stacking duplicates. "Open" = pending OR executing:
+-- an ask being executed right now must still swallow retries, or a duplicate
+-- row parked during the executing window could be approved concurrently and
+-- double-pay.
+CREATE UNIQUE INDEX idx_pending_approvals_open_ask
+    ON pending_approvals(mandate_id, idempotency_key)
+    WHERE status IN ('pending', 'executing');
 CREATE INDEX idx_pending_approvals_customer ON pending_approvals(customer_id, created_at);

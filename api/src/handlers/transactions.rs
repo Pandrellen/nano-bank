@@ -18,11 +18,11 @@
 //!
 //! ## General ledger of record
 //! Deposit and withdrawal post their aggregate effect to the swappable core via
-//! the `Ledger` port (deposit: debit `Bank` / credit `Payable`; withdrawal the
-//! reverse). A **transfer is not posted to the core**: both customer accounts
-//! map to the same `Payable` GL role, so the aggregate effect nets to zero — a
-//! transfer is an internal reclassification recorded only in the local
-//! subledger.
+//! the `Ledger` port (deposit: debit `Bank` / credit `CustomerDeposits`;
+//! withdrawal the reverse). A **transfer is not posted to the core**: both
+//! customer accounts map to the same `CustomerDeposits` GL role, so the aggregate
+//! effect nets to zero — a transfer is an internal reclassification recorded only
+//! in the local subledger.
 //!
 //! Only `chequing` / `savings` accounts are accepted here; `credit_card`
 //! accounts belong to the card rails.
@@ -44,6 +44,8 @@ use validator::Validate;
 
 use crate::config::database::DatabasePool;
 use crate::errors::AppError;
+use crate::fraud::gate::{screen, FraudLink, ScreenInput, Screening};
+use crate::fraud::FraudAgentCtx;
 use crate::handlers::cards::{
     fetch_account_for_update, normalize_amount, post_gl_entry, post_two_legged, reference_number,
     Tx,
@@ -139,7 +141,8 @@ async fn ensure_external_cash_account(pool: &DatabasePool) -> Result<Uuid, sqlx:
 // ---------------------------------------------------------------------------
 
 /// Deposit external cash into a customer account: customer credited (balance
-/// up), `EXTERNAL_CASH` debited. Posts debit `Bank` / credit `Payable` to the GL.
+/// up), `EXTERNAL_CASH` debited. Posts debit `Bank` / credit `CustomerDeposits`
+/// to the GL.
 async fn deposit_money(
     State(state): State<AppState>,
     auth: AuthenticatedCustomer,
@@ -147,6 +150,29 @@ async fn deposit_money(
 ) -> Result<(StatusCode, Json<TransactionResponse>), AppError> {
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
+    let fraud_link = screen(
+        &state,
+        ScreenInput {
+            kind: "deposit",
+            amount,
+            customer_id: auth.customer_id,
+            from_account_id: req.account_id,
+            // Self-directed: a deposit's destination is the customer's own
+            // account, not a payee — sending it as one would make every first
+            // large deposit trip payee-novelty rules. Velocity/device/dormancy
+            // signals still apply via the account and session subjects.
+            to_account_id: None,
+            payee_handle: None,
+            description: Some(&req.description),
+            external_reference: req.external_reference.as_deref(),
+            merchant: None,
+            idempotency_key: None,
+            channel: "web",
+            session_id: auth.session_id,
+            agent: None,
+        },
+    )
+    .await?;
     let cash_id = ensure_external_cash_account(&state.pool).await?;
 
     let mut tx = state.pool.begin().await?;
@@ -165,6 +191,10 @@ async fn deposit_money(
     ensure_operable(account)?;
 
     let reference = reference_number("DEP");
+    let mut metadata = json!({});
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
+    }
     let txn_id = insert_transaction(
         &mut tx,
         &reference,
@@ -173,12 +203,14 @@ async fn deposit_money(
         &req.description,
         account.customer_id,
         req.external_reference.as_deref(),
-        json!({}),
+        metadata,
     )
     .await?;
 
     // customer *credit* (+balance); EXTERNAL_CASH *debit*. GL of record: bank
-    // cash up, customer-deposit liability up.
+    // cash up, customer-deposit liability up (the granular `CustomerDeposits`
+    // role, so deposit liability is one GL quantity across deposits, interest,
+    // and fees — not split with `Payable`).
     post_movement(
         &state,
         &mut tx,
@@ -189,7 +221,7 @@ async fn deposit_money(
         cash_id,
         Some(GlSpec {
             debit: GlAccount::Bank,
-            credit: GlAccount::Payable,
+            credit: GlAccount::CustomerDeposits,
             reference: &reference,
             description: &req.description,
         }),
@@ -197,6 +229,8 @@ async fn deposit_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💰 deposit posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -209,7 +243,7 @@ async fn deposit_money(
 
 /// Withdraw cash from a customer account: customer debited (balance down),
 /// `EXTERNAL_CASH` credited. Enforces the daily withdrawal limit. Posts debit
-/// `Payable` / credit `Bank` to the GL.
+/// `CustomerDeposits` / credit `Bank` to the GL.
 async fn withdraw_money(
     State(state): State<AppState>,
     auth: AuthenticatedCustomer,
@@ -217,6 +251,25 @@ async fn withdraw_money(
 ) -> Result<(StatusCode, Json<TransactionResponse>), AppError> {
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
+    let fraud_link = screen(
+        &state,
+        ScreenInput {
+            kind: "withdrawal",
+            amount,
+            customer_id: auth.customer_id,
+            from_account_id: req.account_id,
+            to_account_id: None,
+            payee_handle: None,
+            description: Some(&req.description),
+            external_reference: req.external_reference.as_deref(),
+            merchant: None,
+            idempotency_key: None,
+            channel: "web",
+            session_id: auth.session_id,
+            agent: None,
+        },
+    )
+    .await?;
     let cash_id = ensure_external_cash_account(&state.pool).await?;
 
     let mut tx = state.pool.begin().await?;
@@ -243,6 +296,10 @@ async fn withdraw_money(
     }
 
     let reference = reference_number("WTH");
+    let mut metadata = json!({});
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
+    }
     let txn_id = insert_transaction(
         &mut tx,
         &reference,
@@ -251,12 +308,12 @@ async fn withdraw_money(
         &req.description,
         account.customer_id,
         req.external_reference.as_deref(),
-        json!({}),
+        metadata,
     )
     .await?;
 
     // customer *debit* (−balance); EXTERNAL_CASH *credit*. GL: customer-deposit
-    // liability down, bank cash down.
+    // liability down (`CustomerDeposits`), bank cash down.
     post_movement(
         &state,
         &mut tx,
@@ -266,7 +323,7 @@ async fn withdraw_money(
         amount,
         cash_id,
         Some(GlSpec {
-            debit: GlAccount::Payable,
+            debit: GlAccount::CustomerDeposits,
             credit: GlAccount::Bank,
             reference: &reference,
             description: &req.description,
@@ -284,6 +341,8 @@ async fn withdraw_money(
     .await?;
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(&state, true);
 
     tracing::info!(account_id = %account.account_id, transaction_id = %txn_id, amount = %amount, "💸 withdrawal posted");
     let resp = load_transaction_response(&state.pool, txn_id).await?;
@@ -338,6 +397,7 @@ async fn transfer_money(
             idempotency_key: req.idempotency_key.as_deref(),
             agent: None,
         },
+        Screening::customer(auth.session_id),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(resp)))
@@ -376,6 +436,7 @@ pub(crate) async fn execute_transfer(
     state: &AppState,
     customer_id: Uuid,
     spec: TransferSpec<'_>,
+    screening: Screening,
 ) -> Result<TransactionResponse, AppError> {
     let amount = spec.amount;
 
@@ -384,6 +445,41 @@ pub(crate) async fn execute_transfer(
             "from and to accounts must differ".to_string(),
         ));
     }
+
+    // Fraud screening BEFORE the transaction opens: a decline must not cost a
+    // row lock, and the 150ms engine budget must never run under one.
+    let scoped_key;
+    let screen_key = match (screening.screen_scope, spec.idempotency_key) {
+        (Some(scope), Some(key)) => {
+            scoped_key = format!("{scope}:{key}");
+            Some(scoped_key.as_str())
+        }
+        (_, key) => key,
+    };
+    let fraud_link: FraudLink = screen(
+        state,
+        ScreenInput {
+            kind: "transfer",
+            amount,
+            customer_id,
+            from_account_id: spec.from_account_id,
+            to_account_id: Some(spec.to_account_id),
+            payee_handle: None,
+            description: Some(spec.description),
+            external_reference: spec.external_reference,
+            merchant: None,
+            idempotency_key: screen_key,
+            channel: screening.channel,
+            session_id: screening.session_id,
+            agent: spec.agent.as_ref().map(|a| FraudAgentCtx {
+                agent_id: a.agent_id,
+                mandate_id: a.mandate_id,
+                cap_override: a.cap_override,
+                approval_latency_seconds: screening.approval_latency_seconds,
+            }),
+        },
+    )
+    .await?;
 
     let fee = transfer_fee();
     let cash_id = ensure_external_cash_account(&state.pool).await?;
@@ -455,6 +551,10 @@ pub(crate) async fn execute_transfer(
         metadata["agent_id"] = json!(agent.agent_id);
         metadata["mandate_id"] = json!(agent.mandate_id);
     }
+    // Fraud linkage: the audit join path to the engine's decision log.
+    if fraud_link.screened {
+        metadata["fraud"] = fraud_link.metadata();
+    }
     let txn_id = insert_transaction(
         &mut tx,
         &reference,
@@ -468,7 +568,7 @@ pub(crate) async fn execute_transfer(
     .await?;
 
     // from *debit* (−balance); to *credit* (+balance). Local-only: both accounts
-    // map to the same `Payable` GL role, so the aggregate effect nets to zero.
+    // map to the same `CustomerDeposits` GL role, so the aggregate effect nets to zero.
     post_movement(
         &state,
         &mut tx,
@@ -482,10 +582,12 @@ pub(crate) async fn execute_transfer(
     .await?;
 
     // Transfer fee: a separate `fee` transaction, funding account → EXTERNAL_CASH,
-    // with the fee recognised as Revenue at the GL. The idempotent early-return
-    // above covers only *sequential* replays; with no unique index a tightly
-    // concurrent same-key duplicate could still post both the transfer and this
-    // fee (deferred idempotency hardening — backlog §8.D).
+    // with the fee recognised as `FeeIncome` at the GL (the same role the e-transfer
+    // and maintenance fees use — fee income is one GL quantity) and the customer
+    // leg on `CustomerDeposits`. The idempotent early-return above covers only
+    // *sequential* replays; with no unique index a tightly concurrent same-key
+    // duplicate could still post both the transfer and this fee (deferred
+    // idempotency hardening — backlog §8.D).
     if fee > Decimal::ZERO {
         let fee_ref = reference_number("FEE");
         let fee_txn = insert_transaction(
@@ -508,8 +610,8 @@ pub(crate) async fn execute_transfer(
             fee,
             cash_id,
             Some(GlSpec {
-                debit: GlAccount::Payable,
-                credit: GlAccount::Revenue,
+                debit: GlAccount::CustomerDeposits,
+                credit: GlAccount::FeeIncome,
                 reference: &fee_ref,
                 description: "transfer fee",
             }),
@@ -558,6 +660,8 @@ pub(crate) async fn execute_transfer(
     }
 
     tx.commit().await?;
+    // Movement committed — settle any deferred fail-open rescore as executed.
+    fraud_link.settle_rescore(state, true);
 
     tracing::info!(
         from = %from.account_id, to = %to.account_id, transaction_id = %txn_id, amount = %amount,
@@ -707,16 +811,18 @@ async fn reverse_transaction(
     .await?;
 
     // Reverse the GL by original type (a transfer posted none, so nothing to undo).
+    // Mirrors the deposit/withdrawal roles: the customer-deposit liability leg is
+    // `CustomerDeposits`.
     let gl = match otype.as_str() {
         "deposit" => Some(GlSpec {
-            debit: GlAccount::Payable,
+            debit: GlAccount::CustomerDeposits,
             credit: GlAccount::Bank,
             reference: &reference,
             description: &reason,
         }),
         "withdrawal" => Some(GlSpec {
             debit: GlAccount::Bank,
-            credit: GlAccount::Payable,
+            credit: GlAccount::CustomerDeposits,
             reference: &reference,
             description: &reason,
         }),
