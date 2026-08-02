@@ -8,6 +8,7 @@ mod ledger;
 mod lynx;
 mod middleware;
 mod models;
+mod outbox;
 mod policy;
 mod rails;
 mod repositories;
@@ -192,6 +193,7 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
 
         // Interest / NIM engine (spec #2): daily accrual + monthly capitalisation
         .nest("/api/v1/finance", handlers::finance::finance_routes())
+        .nest("/api/v1/fraud", handlers::fraud_admin::fraud_admin_routes())
 
         // Interac e-Transfer rails
         .nest("/api/v1/interac", handlers::interac::interac_routes())
@@ -230,6 +232,7 @@ fn build_fraud_check(settings: &Settings) -> std::sync::Arc<dyn fraud::FraudChec
                 settings.fraud.engine_url.clone(),
                 settings.fraud.service_token.clone(),
                 settings.fraud.timeout_ms,
+                settings.fraud.outcomes_timeout_ms,
             ))
         }
         other => {

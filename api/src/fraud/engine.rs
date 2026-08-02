@@ -14,30 +14,23 @@ use super::{FraudAction, FraudCheck, FraudCheckError, FraudDecision, FraudReques
 const BREAKER_THRESHOLD: u32 = 5;
 const BREAKER_OPEN_SECS: u64 = 10;
 
-pub struct EngineFraudCheck {
-    base_url: String,
-    token: String,
-    http: reqwest::Client,
+/// Consecutive-failure circuit breaker, one per endpoint we call.
+///
+/// It is a type rather than a set of fields on the adapter because the two
+/// endpoints have unrelated failure modes and unrelated urgency: `/v1/decisions`
+/// is synchronous and gates money movement, `/v1/outcomes` is a background
+/// drain of already-recorded history. Sharing one breaker between them couples
+/// them in both directions — a slow outcomes drain would open the breaker in
+/// front of live transactions, and a decisions outage would spend the outbox's
+/// retry budget on rows that were never tried.
+#[derive(Default)]
+struct Breaker {
     consecutive_failures: AtomicU32,
     open_until: Mutex<Option<Instant>>,
 }
 
-impl EngineFraudCheck {
-    pub fn new(base_url: impl Into<String>, token: impl Into<String>, timeout_ms: u64) -> Self {
-        Self {
-            base_url: base_url.into(),
-            token: token.into(),
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_millis(timeout_ms))
-                .connect_timeout(Duration::from_millis(timeout_ms.min(50)))
-                .build()
-                .expect("reqwest client"),
-            consecutive_failures: AtomicU32::new(0),
-            open_until: Mutex::new(None),
-        }
-    }
-
-    fn circuit_open(&self) -> bool {
+impl Breaker {
+    fn open(&self) -> bool {
         let mut open = self.open_until.lock().expect("breaker lock");
         match *open {
             Some(until) if Instant::now() < until => true,
@@ -61,6 +54,46 @@ impl EngineFraudCheck {
     fn record_success(&self) {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         *self.open_until.lock().expect("breaker lock") = None;
+    }
+}
+
+pub struct EngineFraudCheck {
+    base_url: String,
+    token: String,
+    http: reqwest::Client,
+    /// Background telemetry gets its own client. `http` carries the synchronous
+    /// decision budget (150ms by default) which is the caller's latency
+    /// envelope, not a sane deadline for an outbox drain.
+    telemetry_http: reqwest::Client,
+    /// Guards `/v1/decisions`, the request path.
+    decisions_breaker: Breaker,
+    /// Guards `/v1/outcomes`, the outbox drain. Deliberately separate — see
+    /// [`Breaker`].
+    telemetry_breaker: Breaker,
+}
+
+impl EngineFraudCheck {
+    pub fn new(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        timeout_ms: u64,
+        outcomes_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            base_url: base_url.into(),
+            token: token.into(),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(timeout_ms))
+                .connect_timeout(Duration::from_millis(timeout_ms.min(50)))
+                .build()
+                .expect("reqwest client"),
+            telemetry_http: reqwest::Client::builder()
+                .timeout(Duration::from_millis(outcomes_timeout_ms))
+                .build()
+                .expect("reqwest telemetry client"),
+            decisions_breaker: Breaker::default(),
+            telemetry_breaker: Breaker::default(),
+        }
     }
 
     fn wire_body(req: &FraudRequest) -> serde_json::Value {
@@ -118,7 +151,7 @@ impl FraudCheck for EngineFraudCheck {
     }
 
     async fn assess(&self, req: &FraudRequest) -> Result<FraudDecision, FraudCheckError> {
-        if self.circuit_open() {
+        if self.decisions_breaker.open() {
             return Err(FraudCheckError::Transport("circuit open".to_string()));
         }
         let sent = self
@@ -131,7 +164,7 @@ impl FraudCheck for EngineFraudCheck {
         let resp = match sent {
             Ok(resp) => resp,
             Err(e) => {
-                self.record_failure();
+                self.decisions_breaker.record_failure();
                 return Err(if e.is_timeout() {
                     FraudCheckError::Timeout
                 } else {
@@ -141,7 +174,7 @@ impl FraudCheck for EngineFraudCheck {
         };
         let status = resp.status();
         if status.is_server_error() {
-            self.record_failure();
+            self.decisions_breaker.record_failure();
             let body = resp.text().await.unwrap_or_default();
             return Err(FraudCheckError::Transport(format!("engine 5xx: {body}")));
         }
@@ -154,7 +187,7 @@ impl FraudCheck for EngineFraudCheck {
                 body,
             });
         }
-        self.record_success();
+        self.decisions_breaker.record_success();
         let value: serde_json::Value = resp
             .json()
             .await
@@ -197,5 +230,98 @@ impl FraudCheck for EngineFraudCheck {
         if let Err(e) = result {
             tracing::warn!(operation_id = %req.operation_id, error = %e, "fraud rescore not delivered");
         }
+    }
+
+    /// Deliver one denial from the outbox. Unlike `rescore` above, this reports
+    /// its outcome honestly rather than swallowing it: the drainer marks the
+    /// row delivered only on success, and a row wrongly marked delivered is
+    /// lost for good.
+    ///
+    /// It also does two things `rescore` does not, deliberately: it checks the
+    /// response status (a 500 or a 401 is a failure, not a delivery), and it
+    /// participates in the circuit breaker, so a dead engine stops a batch of
+    /// 100 from each burning a full timeout.
+    async fn report_denial(&self, payload: &serde_json::Value) -> Result<(), FraudCheckError> {
+        if self.telemetry_breaker.open() {
+            return Err(FraudCheckError::Transport("circuit open".to_string()));
+        }
+        let resp = self
+            .telemetry_http
+            .post(format!("{}/v1/outcomes", self.base_url))
+            .bearer_auth(&self.token)
+            .json(payload)
+            .send()
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() => {
+                self.telemetry_breaker.record_failure();
+                return Err(FraudCheckError::Timeout);
+            }
+            Err(e) => {
+                self.telemetry_breaker.record_failure();
+                return Err(FraudCheckError::Transport(e.to_string()));
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            self.telemetry_breaker.record_success();
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.is_server_error() {
+            self.telemetry_breaker.record_failure();
+            return Err(FraudCheckError::Transport(format!(
+                "engine {status}: {body}"
+            )));
+        }
+        // 4xx is a bank-side contract bug (a malformed payload, a stale token),
+        // not an engine outage — same reasoning as `assess`. Do not trip the
+        // breaker, but do fail the row so it retries into its dead-letter cap
+        // rather than being marked delivered.
+        Err(FraudCheckError::Backend {
+            status: status.as_u16(),
+            body,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two endpoints must not be able to trip each other's breaker.
+    ///
+    /// The failure this guards against is asymmetric and expensive in one
+    /// direction: a struggling `/v1/outcomes` during a 100-row drain is a
+    /// background inconvenience, but if it opens the breaker in front of
+    /// `/v1/decisions` it starts failing live money movement over telemetry.
+    ///
+    /// Asserted on breaker state rather than on the error `assess` returns,
+    /// because `assess` against an unroutable host fails either way — the
+    /// message would be the only difference, and a test that can only tell
+    /// "circuit open" from "connection refused" by string is a test that breaks
+    /// on a reqwest upgrade rather than on a regression.
+    #[tokio::test]
+    async fn telemetry_failures_do_not_open_the_decisions_breaker() {
+        // Reserved-for-documentation address: nothing listens, and nothing
+        // resolves it to somewhere that might.
+        let engine = EngineFraudCheck::new("http://192.0.2.1:1", "t", 50, 50);
+
+        for _ in 0..BREAKER_THRESHOLD {
+            assert!(
+                engine.report_denial(&json!({ "event_key": "x" })).await.is_err(),
+                "the drain must fail against a dead engine"
+            );
+        }
+
+        assert!(
+            engine.telemetry_breaker.open(),
+            "{BREAKER_THRESHOLD} consecutive telemetry failures must open its own breaker"
+        );
+        assert!(
+            !engine.decisions_breaker.open(),
+            "the request path must be untouched by an outcomes outage"
+        );
     }
 }

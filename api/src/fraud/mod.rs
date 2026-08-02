@@ -116,4 +116,13 @@ pub trait FraudCheck: Send + Sync {
     /// moved). Errors are swallowed by implementations — this must never
     /// affect a request path.
     async fn rescore(&self, req: FraudRequest, executed: bool);
+
+    /// Deliver one agent-denial telemetry event (an action the BANK refused,
+    /// so no engine decision exists for it) to the engine's outcome ingestion.
+    ///
+    /// Unlike [`rescore`] this returns a `Result`: it is called by the outbox
+    /// drainer, which must know whether the row may be marked delivered. A
+    /// swallowed error here would silently drop the row forever, which is the
+    /// exact failure the outbox exists to prevent.
+    async fn report_denial(&self, payload: &serde_json::Value) -> Result<(), FraudCheckError>;
 }

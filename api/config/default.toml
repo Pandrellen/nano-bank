@@ -71,3 +71,7 @@ timeout_ms = 150
 fail_closed_above = "1000.00"
 # Must match the engine's FRAUD_ENGINE__AUTH__SERVICE_TOKEN.
 service_token = "dev-service-token"
+# Budget for one agent-denial outbox delivery to /v1/outcomes. Deliberately
+# larger than timeout_ms: that is a caller's latency envelope, this runs in the
+# cron-triggered drain (see k8s/fraud-denial-drainer-cronjob.yaml).
+outcomes_timeout_ms = 2000
