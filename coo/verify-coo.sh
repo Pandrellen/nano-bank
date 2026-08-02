@@ -9,6 +9,16 @@ set -euo pipefail
 COO="${COO_API_URL:-http://localhost:8093}"
 WINDOW="${WINDOW:-30d}"
 
+# Opt-in: seed a bounded burst of demo activity first so the review has non-zero
+# numbers to reason over. Seeding is a demo/test-only concern (never run by app
+# code or k8s manifests) — see testing/seed-demo.sh. Needs the bank :8081 and a
+# Postgres port-forward on ::1:5432. Default off, so a data-bearing env is left
+# untouched.
+if [ "${SEED:-0}" = "1" ]; then
+  echo "== seed demo activity (SEED=1) =="
+  "$(dirname "$0")/../testing/seed-demo.sh"
+fi
+
 echo "== COO health =="
 curl -fsS "$COO/health" | tee /dev/stderr | grep -q '"status":"ok"'
 
