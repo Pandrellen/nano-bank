@@ -24,7 +24,7 @@ spec:
         - { name: API_PORT,           value: "8093" }
         # Durable memory is best-effort: if this Qdrant is absent the agent still
         # answers from live tools (SafeMemory degrades to no-op).
-        - { name: QDRANT_URL,         value: http://qdrant:6333 }
+        - { name: QDRANT_URL,         value: http://agent-qdrant:6333 }
         - { name: MEMORY_NAMESPACE,   value: coo }
 ---
 apiVersion: v1
