@@ -64,9 +64,7 @@ npm run dev
 
 2. Tests: unit tests run with `npm test` (vitest); an end-to-end auth suite lives in `e2e/` and runs against a live stack via `../scripts/e2e-ui.sh` (needs Node 20).
 
-3. lucide-react is added but not currently used, there is intention to use it imminently.
-
-4. Learn More on the main page is a dead link at present.
+3. Learn More on the main page is a dead link at present.
 
 ## Demo account
 

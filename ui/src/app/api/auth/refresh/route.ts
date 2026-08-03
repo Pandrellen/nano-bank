@@ -17,14 +17,15 @@ export async function GET(request: NextRequest) {
   const result = await refreshSessionAction();
   const target = result.status === "refreshed" ? next : "/auth/signin";
 
-  // Build the absolute redirect from the browser-facing host, NOT request.url:
-  // the Next standalone server reports request.url's host as its bind address
-  // (0.0.0.0), so redirecting there would bounce the browser to a different
-  // origin and drop the host-only session cookies. Prefer the proxy's forwarded
-  // host, then the Host header, and only fall back to the request origin.
-  const host = request.headers.get("x-forwarded-host") ?? request.headers.get("host");
-  const proto = request.headers.get("x-forwarded-proto") ?? request.nextUrl.protocol.replace(":", "");
-  const base = host ? `${proto}://${host}` : request.nextUrl.origin;
-
-  return NextResponse.redirect(new URL(target, base));
+  // Redirect with a RELATIVE Location, which the browser resolves against its own
+  // address-bar origin. We deliberately avoid an absolute URL built from
+  // request.url (the Next standalone server reports its bind address 0.0.0.0,
+  // which would bounce the browser off-origin and drop host-only session cookies)
+  // AND from the Host / X-Forwarded-Host headers (client-controlled on the plain
+  // NodePort Service — trusting them is an open-redirect vector). `target` is
+  // always a sanitised same-origin path, so a relative redirect suffices.
+  return new NextResponse(null, {
+    status: 307,
+    headers: { Location: target },
+  });
 }

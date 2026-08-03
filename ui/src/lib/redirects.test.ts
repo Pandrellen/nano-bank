@@ -10,6 +10,13 @@ describe("sanitizeNextPath", () => {
     expect(sanitizeNextPath("//evil.com")).toBe("/dashboard");
     expect(sanitizeNextPath("https://evil.com")).toBe("/dashboard");
   });
+  it("rejects backslash-based open-redirect bypasses", () => {
+    // `new URL()` normalises `\` to `/`, so these would resolve to an external host.
+    expect(sanitizeNextPath("/\\evil.com")).toBe("/dashboard");
+    expect(sanitizeNextPath("/\\/evil.com")).toBe("/dashboard");
+    expect(sanitizeNextPath("\\\\evil.com")).toBe("/dashboard");
+    expect(sanitizeNextPath("/foo\\bar")).toBe("/dashboard");
+  });
   it("falls back on empty / missing input", () => {
     expect(sanitizeNextPath("")).toBe("/dashboard");
     expect(sanitizeNextPath(null)).toBe("/dashboard");
