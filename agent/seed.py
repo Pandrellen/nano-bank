@@ -86,4 +86,17 @@ def seed_demo(bank) -> dict:
         if i == 0:
             fund(bank, token, acc["account_id"], "1000")
         customers.append({**c, "account_id": acc["account_id"]})
+
+    # Adopt the fixed demo customer (seeded out-of-band by scripts/demo-seed.sh)
+    # so the agent can act as it. API-only: login + read profile; skip if absent.
+    try:
+        demo_tok = bank.login("demo@nano.bank", "Demo-Pass-2026")
+        demo_cid = bank.profile(demo_tok)["customer_id"]
+    except Exception:
+        pass
+    else:
+        store.put(demo_cid, "demo@nano.bank", "Demo-Pass-2026")
+        customers.append({"customer_id": demo_cid, "email": "demo@nano.bank",
+                          "password": "Demo-Pass-2026", "first": "Jordan"})
+
     return {"customers": customers, "creds": store.as_dict()}
