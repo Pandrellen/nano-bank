@@ -2555,3 +2555,155 @@ async fn admin_service_token(c: &reqwest::Client) -> String {
     let v: Value = r.json().await.unwrap();
     v["access_token"].as_str().unwrap().to_string()
 }
+
+// ---------------------------------------------------------------------------
+// #36: the audit and the ask it describes commit as one unit, and a benign
+// duplicate race resolves instead of 500ing.
+// ---------------------------------------------------------------------------
+
+/// A park that cannot be written leaves no audit behind.
+///
+/// Before the fix, `record_action` autocommitted and *then* the park ran: a
+/// failed park left an `agent_actions` row describing a step-up that no
+/// `pending_approvals` row backed. Since #39 that is no longer merely untidy —
+/// the same CTE mirrors the audit into `agent_denial_outbox`, so the dangling
+/// row reaches the fraud engine as an `agent_denial`, and a retry mints a fresh
+/// `action_id` (hence a fresh `event_key`) for the same logical attempt.
+///
+/// Failure is injected the way `expiry_that_cannot_be_audited_does_not_expire`
+/// does it: a trigger scoped to this mandate, so parallel tests are untouched,
+/// with the results captured before it is dropped — Rust has no `finally`, and
+/// a failed assertion must not leave the trigger poisoning later runs.
+#[tokio::test]
+async fn a_park_that_fails_leaves_no_audit_and_no_outbox_row() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION nb_test_block_park() RETURNS trigger \
+         AS $$ BEGIN RAISE EXCEPTION 'injected park failure'; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_park_x ON pending_approvals")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER nb_test_block_park_x BEFORE INSERT ON pending_approvals \
+         FOR EACH ROW WHEN (NEW.mandate_id = '{mandate}'::uuid) \
+         EXECUTE FUNCTION nb_test_block_park()"
+    ))
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // 250 is over max_per_tx (200) → step_up_required → tries to park → blocked.
+    let status = agent_transfer(&c, &atoken, b, 250.0, &format!("atomic-{}", Uuid::new_v4()))
+        .await
+        .status()
+        .as_u16();
+    // Scoped to the step-up audit specifically: minting the agent token writes
+    // its own `token:issue` row under this mandate, so a bare count is 1
+    // whether or not the fix works — the difference between this test and one
+    // that passes for the wrong reason.
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_actions \
+         WHERE mandate_id = $1 AND operation = 'transfer' AND reason = 'MAX_PER_TX_EXCEEDED'",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let mirrored = outbox_rows(&db, mandate).await.len();
+
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_park_x ON pending_approvals")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    assert!(status >= 500, "a park that cannot be written must not 2xx");
+    assert_eq!(audits, 0, "the audit must roll back with the ask it describes");
+    assert_eq!(mirrored, 0, "and nothing may reach the engine for it");
+}
+
+/// A duplicate racing an *uncommitted* park adopts the winner's ask.
+///
+/// `ON CONFLICT DO NOTHING` does not block on an uncommitted conflicting row —
+/// it returns nothing at once, and the fallback `SELECT` could not see that row
+/// either, so `fetch_one` gave `RowNotFound` → 500 on what is a benign
+/// duplicate. `DO UPDATE` takes the lock and waits.
+///
+/// The race is staged rather than hoped for: an open transaction holds a
+/// conflicting row uncommitted while the request runs, which is deterministic
+/// where firing two requests and hoping they interleave is not.
+#[tokio::test]
+async fn a_duplicate_racing_an_uncommitted_park_adopts_it() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+    let key = format!("dup-{}", Uuid::new_v4());
+
+    // Hold a conflicting ask uncommitted.
+    let mut holder = db.begin().await.unwrap();
+    let winner: Uuid = sqlx::query_scalar(
+        "INSERT INTO pending_approvals \
+         (mandate_id, agent_id, customer_id, account_id, to_account_id, amount, \
+          description, idempotency_key, reason, expires_at) \
+         VALUES ($1, $2, (SELECT customer_id FROM mandates WHERE mandate_id = $1), \
+                 $3, $4, 250.00, 'held', $5, 'MAX_PER_TX_EXCEEDED', \
+                 CURRENT_TIMESTAMP + INTERVAL '30 minutes') \
+         RETURNING approval_id",
+    )
+    .bind(mandate)
+    .bind(agent_id)
+    .bind(a)
+    .bind(b)
+    .bind(&key)
+    .fetch_one(&mut *holder)
+    .await
+    .unwrap();
+
+    // Fire the duplicate; it must block on the uncommitted row rather than fail.
+    let c2 = client();
+    let atoken2 = atoken.clone();
+    let key2 = key.clone();
+    let racer = tokio::spawn(async move { agent_transfer(&c2, &atoken2, b, 250.0, &key2).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    holder.commit().await.unwrap();
+
+    let resp = racer.await.unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(status, 202, "a benign duplicate is not a server fault: {body}");
+    assert_eq!(
+        body["approval_id"].as_str().unwrap(),
+        winner.to_string(),
+        "the duplicate must adopt the winner's ask, not mint a second"
+    );
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pending_approvals WHERE mandate_id = $1 AND idempotency_key = $2",
+    )
+    .bind(mandate)
+    .bind(&key)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(open, 1, "exactly one ask for one idempotency key");
+}
