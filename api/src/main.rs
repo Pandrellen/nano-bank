@@ -188,6 +188,12 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
         .nest("/api/v1/agent", handlers::agent_api::agent_api_routes())
         // Step-up approvals (Phase 3): the customer resolves parked transfers
         .nest("/api/v1/approvals", handlers::approvals::approval_routes())
+        // Back-office read plane: service-token reads *across* customers, for a
+        // CRM or support console. Read-only by design — see the module docs.
+        .nest(
+            "/api/v1/back-office",
+            handlers::back_office::back_office_routes(),
+        )
         // Credit-card payment rails (issuer endpoints)
         .nest("/api/v1/cards", handlers::cards::card_routes())
 
