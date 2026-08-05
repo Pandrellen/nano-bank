@@ -2190,3 +2190,520 @@ async fn expiry_audits(db: &sqlx::PgPool, mandate: Uuid) -> i64 {
     .await
     .unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// Agent-denial outbox: every refusal the bank records is mirrored for the
+// fraud engine, in the same statement, so the two can never disagree.
+// ---------------------------------------------------------------------------
+
+/// Outbox rows for one mandate, newest last.
+async fn outbox_rows(db: &sqlx::PgPool, mandate: Uuid) -> Vec<(Uuid, String, Value)> {
+    sqlx::query_as::<_, (Uuid, String, Value)>(
+        "SELECT o.action_id, o.event_key, o.payload \
+           FROM agent_denial_outbox o JOIN agent_actions a USING (action_id) \
+          WHERE a.mandate_id = $1 ORDER BY o.created_at",
+    )
+    .bind(mandate)
+    .fetch_all(db)
+    .await
+    .unwrap()
+}
+
+/// A denied transfer is mirrored exactly once, keyed so the engine can dedupe.
+#[tokio::test]
+async fn denied_transfer_is_mirrored_to_the_outbox() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    // No payee allowlist entry for the destination → PAYEE_NOT_ALLOWED.
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 5000.0, 5000.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+    let stranger = create_account(&c, &session(&c).await.1, "chequing").await;
+
+    let resp = agent_transfer(&c, &atoken, stranger, 10.0, &format!("den-{}", Uuid::new_v4())).await;
+    assert!(resp.status().as_u16() >= 400, "transfer must be refused");
+
+    let rows = outbox_rows(&db, mandate).await;
+    assert_eq!(rows.len(), 1, "one denial, one outbox row: {rows:?}");
+    let (action_id, event_key, payload) = &rows[0];
+    assert_eq!(
+        event_key,
+        &format!("agent-denial:{action_id}"),
+        "event_key must derive from action_id so redelivery is idempotent"
+    );
+    assert_eq!(payload["event_type"], "agent_denial");
+    assert_eq!(payload["source"], "bank_pep");
+    assert_eq!(payload["event_key"], event_key.as_str());
+    assert_eq!(payload["detail"]["decision"], "denied");
+    assert_eq!(payload["detail"]["operation"], "transfer");
+    assert!(payload["detail"]["reason"].is_string());
+
+    // Money is a string-decimal on this wire, never a JSON number — the same
+    // convention `/v1/decisions` states out loud in `fraud/engine.rs`. Without
+    // the `::text` cast in the CTE, `jsonb_build_object` emits the DECIMAL as a
+    // bare number and every consumer is one float parse away from losing cents.
+    // Both halves matter: `is_string` is the contract, and the scale is the
+    // proof the cast did not quietly normalise `10.00` down to `10`.
+    let amount = &payload["detail"]["amount"];
+    assert!(amount.is_string(), "amount must be a JSON string: {payload}");
+    assert_eq!(amount, "10.00", "the column's scale must survive the cast");
+}
+
+/// The guard that keeps this telemetry and not a firehose: allowed actions are
+/// audited, never mirrored.
+///
+/// Driven through an in-scope READ, not a transfer, on purpose. A transfer
+/// needs a funded account, and funding 503s wherever the GL chart-of-accounts
+/// skew is present — `funded_account` then returns None and the test exits
+/// before its assertions, passing whatever the guard does. That is exactly how
+/// the first version of this test passed with the guard removed.
+#[tokio::test]
+async fn allowed_action_is_not_mirrored() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // Two allowed decisions: the token issuance and the in-scope read.
+    assert_eq!(
+        agent_get(&c, &atoken, "/api/v1/agent/account")
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    let audited: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM agent_actions WHERE mandate_id = $1 AND decision = 'allowed'")
+            .bind(mandate)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(audited >= 2, "the allowed actions really happened: {audited}");
+    assert!(
+        outbox_rows(&db, mandate).await.is_empty(),
+        "allowed actions must not become denial telemetry"
+    );
+}
+
+/// The headline case from INTEGRATION_DESIGN §10a. Scope denials never touch
+/// the transfer path, so a transfer-only hook would miss exactly the
+/// enumeration this telemetry exists to reveal.
+#[tokio::test]
+async fn scope_denial_is_mirrored_to_the_outbox() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // In scope: audited, not mirrored.
+    assert_eq!(
+        agent_get(&c, &atoken, "/api/v1/agent/account")
+            .await
+            .status()
+            .as_u16(),
+        200
+    );
+    assert!(outbox_rows(&db, mandate).await.is_empty());
+
+    // Out of scope: this is the probe.
+    assert_eq!(
+        agent_get(&c, &atoken, "/api/v1/agent/transactions")
+            .await
+            .status()
+            .as_u16(),
+        403
+    );
+    let rows = outbox_rows(&db, mandate).await;
+    assert_eq!(rows.len(), 1, "scope denial must be mirrored: {rows:?}");
+    assert_eq!(rows[0].2["detail"]["reason"], "SCOPE_MISSING");
+    assert_eq!(rows[0].2["detail"]["operation"], "read:transactions");
+}
+
+/// The property the CTE exists for. If the outbox insert fails, the audit row
+/// must fail with it — a denial recorded without its telemetry, or telemetry
+/// for a denial that never happened, are both records that lie.
+#[tokio::test]
+async fn audit_and_outbox_commit_together_or_not_at_all() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION nb_test_block_outbox() RETURNS trigger \
+         AS $$ BEGIN RAISE EXCEPTION 'injected outbox failure'; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_outbox_x ON agent_denial_outbox")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER nb_test_block_outbox_x BEFORE INSERT ON agent_denial_outbox \
+         FOR EACH ROW WHEN (NEW.payload->'detail'->>'mandate_id' = '{mandate}') \
+         EXECUTE FUNCTION nb_test_block_outbox()"
+    ))
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // Capture first, drop the trigger, then assert: Rust has no `finally`, and
+    // a failed assertion must not leave the trigger poisoning later runs.
+    let blocked = agent_get(&c, &atoken, "/api/v1/agent/transactions")
+        .await
+        .status()
+        .as_u16();
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_actions WHERE mandate_id = $1 AND operation = 'read:transactions'",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let mirrored = outbox_rows(&db, mandate).await.len();
+
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_outbox_x ON agent_denial_outbox")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(blocked, 500, "an unrecordable denial must fail loudly");
+    assert_eq!(
+        audits, 0,
+        "the audit row must roll back with its telemetry, not commit alone"
+    );
+    assert_eq!(mirrored, 0);
+
+    // And the retry, once the injected failure is gone, records both.
+    assert_eq!(
+        agent_get(&c, &atoken, "/api/v1/agent/transactions")
+            .await
+            .status()
+            .as_u16(),
+        403
+    );
+    assert_eq!(outbox_rows(&db, mandate).await.len(), 1);
+}
+
+/// The drain claims, delivers, and does not re-deliver. With the backend off it
+/// must not claim at all: burning the retry budget against an engine nobody
+/// asked us to call would dead-letter the backlog before it is ever enabled.
+#[tokio::test]
+async fn flush_denials_is_idempotent_and_skips_when_backend_off() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+    assert_eq!(
+        agent_get(&c, &atoken, "/api/v1/agent/transactions")
+            .await
+            .status()
+            .as_u16(),
+        403
+    );
+    let rows = outbox_rows(&db, mandate).await;
+    assert_eq!(rows.len(), 1);
+
+    let svc = admin_service_token(&c).await;
+    let flush = c
+        .post(format!(
+            "{}/api/v1/fraud/admin/flush-denials",
+            base_url()
+        ))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+    let body: Value = flush.json().await.unwrap();
+
+    let (delivered, attempts): (bool, i32) = sqlx::query_as(
+        "SELECT delivered, delivery_attempts FROM agent_denial_outbox WHERE action_id = $1",
+    )
+    .bind(rows[0].0)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+
+    if body.get("skipped").is_some() {
+        // backend = "off": the default. Nothing claimed, nothing burned.
+        assert!(!delivered);
+        assert_eq!(attempts, 0, "a skipped flush must not spend an attempt");
+    } else {
+        assert!(delivered, "with the engine reachable the row is delivered");
+        assert_eq!(attempts, 1);
+        // Second flush must not re-deliver it.
+        let again = c
+            .post(format!(
+                "{}/api/v1/fraud/admin/flush-denials",
+                base_url()
+            ))
+            .bearer_auth(&svc)
+            .send()
+            .await
+            .unwrap();
+        let again: Value = again.json().await.unwrap();
+        assert_eq!(again["claimed"], 0, "a delivered row is never re-claimed");
+    }
+}
+
+/// Retention is not conditional on delivery being switched on.
+///
+/// This is the case the purge exists for and the one it originally missed:
+/// `backend = "off"` is the default, denials still accumulate, and the drain
+/// returns early long before the DELETE — so on the deployments that grow this
+/// table fastest, nothing ever collected it. The rows are undelivered with zero
+/// attempts, which the old dead-letter predicate (`delivery_attempts >= 5`) did
+/// not match either, so simply moving the DELETE up would not have been enough.
+///
+/// The second, recent row is what makes this test able to fail: a purge that
+/// deleted every undelivered row would satisfy the first assertion happily.
+#[tokio::test]
+async fn retention_purges_abandoned_rows_with_the_backend_off() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let account = create_account(&c, &token, "chequing").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_mandate(&c, &token, agent_id, account, &["read:balance"]).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    // Two out-of-scope reads → two denials → two outbox rows, both undelivered
+    // with zero attempts, exactly as the default configuration leaves them.
+    for _ in 0..2 {
+        assert_eq!(
+            agent_get(&c, &atoken, "/api/v1/agent/transactions")
+                .await
+                .status()
+                .as_u16(),
+            403
+        );
+    }
+    let rows = outbox_rows(&db, mandate).await;
+    assert_eq!(rows.len(), 2, "two denials, two rows: {rows:?}");
+    let (aged, fresh) = (rows[0].0, rows[1].0);
+
+    sqlx::query(
+        "UPDATE agent_denial_outbox SET created_at = CURRENT_TIMESTAMP - INTERVAL '31 days' \
+         WHERE action_id = $1",
+    )
+    .bind(aged)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let svc = admin_service_token(&c).await;
+    let flush = c
+        .post(format!("{}/api/v1/fraud/admin/flush-denials", base_url()))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(flush.status().as_u16(), 200);
+    let body: Value = flush.json().await.unwrap();
+    assert!(
+        body["purged"].as_u64().unwrap_or(0) >= 1,
+        "the flush must report what it collected, backend off or not: {body}"
+    );
+
+    let survivors: Vec<Uuid> = outbox_rows(&db, mandate)
+        .await
+        .into_iter()
+        .map(|(action_id, _, _)| action_id)
+        .collect();
+    assert!(
+        !survivors.contains(&aged),
+        "a 31-day-old undelivered row is past its window: {survivors:?}"
+    );
+    assert!(
+        survivors.contains(&fresh),
+        "a row created seconds ago must not be swept up with it: {survivors:?}"
+    );
+}
+
+/// Mint a network/admin-plane service token — same path the drainer CronJob uses.
+async fn admin_service_token(c: &reqwest::Client) -> String {
+    let r = c
+        .post(format!("{}/api/v1/auth/service-token", base_url()))
+        .json(&json!({ "client_secret": "nano-bank-visa-network-secret-change-me" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "service-token: {}", r.status());
+    let v: Value = r.json().await.unwrap();
+    v["access_token"].as_str().unwrap().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// #36: the audit and the ask it describes commit as one unit, and a benign
+// duplicate race resolves instead of 500ing.
+// ---------------------------------------------------------------------------
+
+/// A park that cannot be written leaves no audit behind.
+///
+/// Before the fix, `record_action` autocommitted and *then* the park ran: a
+/// failed park left an `agent_actions` row describing a step-up that no
+/// `pending_approvals` row backed. Since #39 that is no longer merely untidy —
+/// the same CTE mirrors the audit into `agent_denial_outbox`, so the dangling
+/// row reaches the fraud engine as an `agent_denial`, and a retry mints a fresh
+/// `action_id` (hence a fresh `event_key`) for the same logical attempt.
+///
+/// Failure is injected the way `expiry_that_cannot_be_audited_does_not_expire`
+/// does it: a trigger scoped to this mandate, so parallel tests are untouched,
+/// with the results captured before it is dropped — Rust has no `finally`, and
+/// a failed assertion must not leave the trigger poisoning later runs.
+#[tokio::test]
+async fn a_park_that_fails_leaves_no_audit_and_no_outbox_row() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION nb_test_block_park() RETURNS trigger \
+         AS $$ BEGIN RAISE EXCEPTION 'injected park failure'; END $$ LANGUAGE plpgsql",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_park_x ON pending_approvals")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE TRIGGER nb_test_block_park_x BEFORE INSERT ON pending_approvals \
+         FOR EACH ROW WHEN (NEW.mandate_id = '{mandate}'::uuid) \
+         EXECUTE FUNCTION nb_test_block_park()"
+    ))
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // 250 is over max_per_tx (200) → step_up_required → tries to park → blocked.
+    let status = agent_transfer(&c, &atoken, b, 250.0, &format!("atomic-{}", Uuid::new_v4()))
+        .await
+        .status()
+        .as_u16();
+    // Scoped to the step-up audit specifically: minting the agent token writes
+    // its own `token:issue` row under this mandate, so a bare count is 1
+    // whether or not the fix works — the difference between this test and one
+    // that passes for the wrong reason.
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_actions \
+         WHERE mandate_id = $1 AND operation = 'transfer' AND reason = 'MAX_PER_TX_EXCEEDED'",
+    )
+    .bind(mandate)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    let mirrored = outbox_rows(&db, mandate).await.len();
+
+    sqlx::query("DROP TRIGGER IF EXISTS nb_test_block_park_x ON pending_approvals")
+        .execute(&db)
+        .await
+        .unwrap();
+
+    assert!(status >= 500, "a park that cannot be written must not 2xx");
+    assert_eq!(audits, 0, "the audit must roll back with the ask it describes");
+    assert_eq!(mirrored, 0, "and nothing may reach the engine for it");
+}
+
+/// A duplicate racing an *uncommitted* park adopts the winner's ask.
+///
+/// `ON CONFLICT DO NOTHING` does not block on an uncommitted conflicting row —
+/// it returns nothing at once, and the fallback `SELECT` could not see that row
+/// either, so `fetch_one` gave `RowNotFound` → 500 on what is a benign
+/// duplicate. `DO UPDATE` takes the lock and waits.
+///
+/// The race is staged rather than hoped for: an open transaction holds a
+/// conflicting row uncommitted while the request runs, which is deterministic
+/// where firing two requests and hoping they interleave is not.
+#[tokio::test]
+async fn a_duplicate_racing_an_uncommitted_park_adopts_it() {
+    let c = client();
+    require_stack!(&c);
+    let Some(db) = test_db().await else { return };
+    let (_customer, token) = session(&c).await;
+    let a = create_account(&c, &token, "chequing").await;
+    let b = create_account(&c, &token, "savings").await;
+    let (agent_id, secret) = register_agent(&c).await;
+    let mandate = grant_transfer_mandate(&c, &token, agent_id, a, 200.0, 500.0, None).await;
+    let atoken = agent_token(&c, agent_id, &secret, mandate).await;
+    let key = format!("dup-{}", Uuid::new_v4());
+
+    // Hold a conflicting ask uncommitted.
+    let mut holder = db.begin().await.unwrap();
+    let winner: Uuid = sqlx::query_scalar(
+        "INSERT INTO pending_approvals \
+         (mandate_id, agent_id, customer_id, account_id, to_account_id, amount, \
+          description, idempotency_key, reason, expires_at) \
+         VALUES ($1, $2, (SELECT customer_id FROM mandates WHERE mandate_id = $1), \
+                 $3, $4, 250.00, 'held', $5, 'MAX_PER_TX_EXCEEDED', \
+                 CURRENT_TIMESTAMP + INTERVAL '30 minutes') \
+         RETURNING approval_id",
+    )
+    .bind(mandate)
+    .bind(agent_id)
+    .bind(a)
+    .bind(b)
+    .bind(&key)
+    .fetch_one(&mut *holder)
+    .await
+    .unwrap();
+
+    // Fire the duplicate; it must block on the uncommitted row rather than fail.
+    let c2 = client();
+    let atoken2 = atoken.clone();
+    let key2 = key.clone();
+    let racer = tokio::spawn(async move { agent_transfer(&c2, &atoken2, b, 250.0, &key2).await });
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    holder.commit().await.unwrap();
+
+    let resp = racer.await.unwrap();
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(status, 202, "a benign duplicate is not a server fault: {body}");
+    assert_eq!(
+        body["approval_id"].as_str().unwrap(),
+        winner.to_string(),
+        "the duplicate must adopt the winner's ask, not mint a second"
+    );
+    let open: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pending_approvals WHERE mandate_id = $1 AND idempotency_key = $2",
+    )
+    .bind(mandate)
+    .bind(&key)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(open, 1, "exactly one ask for one idempotency key");
+}

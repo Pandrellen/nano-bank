@@ -19,5 +19,8 @@ nodes:
   - containerPort: 5432
     hostPort: 5432
     protocol: TCP
+  - containerPort: 30300
+    hostPort: 3000
+    protocol: TCP
 - role: worker
 - role: worker

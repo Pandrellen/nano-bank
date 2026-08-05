@@ -10,6 +10,7 @@ pub mod cards;
 pub mod customers;
 pub mod docs;
 pub mod finance;
+pub mod fraud_admin;
 pub mod health;
 pub mod interac;
 pub mod interac_payees;

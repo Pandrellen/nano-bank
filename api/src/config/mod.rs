@@ -100,6 +100,11 @@ pub struct FraudSettings {
     /// Bearer token for the engine's decision API (its FRAUD_ENGINE__AUTH__SERVICE_TOKEN).
     #[serde(default)]
     pub service_token: String,
+    /// Budget for one outbox delivery to /v1/outcomes. Separate from
+    /// `timeout_ms` on purpose: that is a caller's latency envelope, this runs
+    /// in a cron-triggered drain where a couple of seconds is fine.
+    #[serde(default = "default_outcomes_timeout_ms")]
+    pub outcomes_timeout_ms: u64,
 }
 
 fn default_fraud_backend() -> String {
@@ -114,6 +119,10 @@ fn default_fraud_timeout_ms() -> u64 {
     150
 }
 
+fn default_outcomes_timeout_ms() -> u64 {
+    2000
+}
+
 fn default_fail_closed_above() -> Decimal {
     Decimal::new(100000, 2) // 1000.00 CAD
 }
@@ -126,6 +135,7 @@ impl Default for FraudSettings {
             timeout_ms: default_fraud_timeout_ms(),
             fail_closed_above: default_fail_closed_above(),
             service_token: String::new(),
+            outcomes_timeout_ms: default_outcomes_timeout_ms(),
         }
     }
 }

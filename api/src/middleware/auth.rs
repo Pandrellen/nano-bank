@@ -156,8 +156,13 @@ impl FromRequestParts<AppState> for AuthenticatedAgent {
     }
 }
 
-/// A machine principal (the card network/processor) authenticated on the
-/// network plane. Carries no customer identity by design.
+/// A machine principal authenticated on the service plane. Carries no customer
+/// identity by design.
+///
+/// Originally the card network/processor only. It now also guards the
+/// back-office read plane (`/back-office/*`), so the refusal below no longer
+/// names the card rails specifically — it was misleading on every other route
+/// that uses this extractor.
 pub struct AuthenticatedService;
 
 #[async_trait]
@@ -169,12 +174,12 @@ impl FromRequestParts<AppState> for AuthenticatedService {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let claims = bearer_claims(parts, state)?;
-        // A valid customer token on a network endpoint is the wrong plane → 403.
+        // A valid customer token on a service endpoint is the wrong plane → 403.
         if claims.role == TokenRole::Service {
             Ok(AuthenticatedService)
         } else {
             Err(AppError::Authorization(
-                "A service access token is required for the card rails".to_string(),
+                "A service access token is required".to_string(),
             ))
         }
     }

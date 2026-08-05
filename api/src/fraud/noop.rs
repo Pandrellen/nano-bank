@@ -26,4 +26,11 @@ impl FraudCheck for NoopFraudCheck {
     }
 
     async fn rescore(&self, _req: FraudRequest, _executed: bool) {}
+
+    /// Never reached: the drainer skips entirely when the backend is off,
+    /// rather than claiming rows and burning their retry budget against an
+    /// engine nobody asked it to call.
+    async fn report_denial(&self, _payload: &serde_json::Value) -> Result<(), FraudCheckError> {
+        Ok(())
+    }
 }

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { refreshSessionAction } from "@/actions/auth";
+import { sanitizeNextPath } from "@/lib/redirects";
 
 /** Silent token-refresh entry point for protected Server Components.
  *
@@ -10,15 +11,21 @@ import { refreshSessionAction } from "@/actions/auth";
  * cookies); otherwise — session truly over, or the refresh call failed — we send
  * the user to sign in. */
 export async function GET(request: NextRequest) {
-  const requested = request.nextUrl.searchParams.get("next") ?? "/dashboard";
   // Only allow same-origin relative paths as the redirect target (no open redirect).
-  const next = requested.startsWith("/") && !requested.startsWith("//") ? requested : "/dashboard";
+  const next = sanitizeNextPath(request.nextUrl.searchParams.get("next"));
 
   const result = await refreshSessionAction();
+  const target = result.status === "refreshed" ? next : "/auth/signin";
 
-  if (result.status === "refreshed") {
-    return NextResponse.redirect(new URL(next, request.url));
-  }
-
-  return NextResponse.redirect(new URL("/auth/signin", request.url));
+  // Redirect with a RELATIVE Location, which the browser resolves against its own
+  // address-bar origin. We deliberately avoid an absolute URL built from
+  // request.url (the Next standalone server reports its bind address 0.0.0.0,
+  // which would bounce the browser off-origin and drop host-only session cookies)
+  // AND from the Host / X-Forwarded-Host headers (client-controlled on the plain
+  // NodePort Service — trusting them is an open-redirect vector). `target` is
+  // always a sanitised same-origin path, so a relative redirect suffices.
+  return new NextResponse(null, {
+    status: 307,
+    headers: { Location: target },
+  });
 }

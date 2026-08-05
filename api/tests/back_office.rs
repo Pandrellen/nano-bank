@@ -1,17 +1,24 @@
-//! Integration tests for the service-plane back-office operational reads.
+//! Integration tests for the back-office read plane (`/api/v1/back-office/*`).
 //!
-//! Graceful-skip harness (mirrors tests/finance.rs): every test probes
-//! `GET /health` and returns early (still passing) when the API is unreachable,
-//! so `cargo test` passes with nothing running. No GL core needed — these are
-//! reads. Run against a live stack:
-//!   cd api && cargo test --test back_office -- --nocapture
-//! Override the base URL with NANO_BANK_TEST_URL.
+//! Same harness as `tests/agents.rs` and `tests/finance.rs`: every test probes
+//! `GET /health` and **skips (still passes)** when the API isn't running. These
+//! need only the API and Postgres — nothing here writes, so no GL core is
+//! involved.
+//!
+//! ```bash
+//! cd api && cargo test --test back_office -- --nocapture
+//! ```
+//! Override the base URL with `NANO_BANK_TEST_URL`.
+//!
+//! The tests that matter most are the plane guard ones. This plane can read any
+//! customer, so the only thing standing between a consumer token and everybody
+//! else's balances is `AuthenticatedService` — and a guard nobody tests is a
+//! guard that quietly stops working.
 
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 const TEST_PASSWORD: &str = "securepass123";
-// Dev service-plane secret (api/config/default.toml). Overridable in CI.
 const SERVICE_SECRET: &str = "nano-bank-visa-network-secret-change-me";
 
 fn base_url() -> String {
@@ -23,7 +30,63 @@ fn client() -> reqwest::Client {
 }
 
 async fn stack_up(c: &reqwest::Client) -> bool {
-    c.get(format!("{}/health", base_url())).send().await.is_ok()
+    matches!(
+        c.get(format!("{}/health", base_url())).send().await,
+        Ok(r) if r.status().is_success()
+    )
+}
+
+macro_rules! require_stack {
+    ($c:expr) => {
+        if !stack_up($c).await {
+            eprintln!("SKIP: nano-bank not reachable at {}", base_url());
+            return;
+        }
+    };
+}
+
+fn bo(path: &str) -> String {
+    format!("{}/api/v1/back-office{}", base_url(), path)
+}
+
+async fn create_customer(c: &reqwest::Client) -> (Uuid, String) {
+    let n = Uuid::new_v4().as_u128();
+    let email = format!("botest_{}@example.com", n % 1_000_000_000);
+    let body = json!({
+        "email": email,
+        "phone_number": format!("{:010}", (n % 10_000_000_000u128)),
+        "first_name": "Back",
+        "last_name": "Office",
+        "date_of_birth": "1990-01-01",
+        "sin": format!("{:09}", n % 1_000_000_000),
+        "password": TEST_PASSWORD
+    });
+    let resp = c
+        .post(format!("{}/api/v1/customers", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create customer: {}",
+        resp.status()
+    );
+    let v: Value = resp.json().await.unwrap();
+    let id = Uuid::parse_str(v["customer_id"].as_str().unwrap()).unwrap();
+    (id, email)
+}
+
+async fn login(c: &reqwest::Client, email: &str) -> String {
+    let resp = c
+        .post(format!("{}/api/v1/auth/login", base_url()))
+        .json(&json!({ "email": email, "password": TEST_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "login: {}", resp.status());
+    let v: Value = resp.json().await.unwrap();
+    v["access_token"].as_str().unwrap().to_string()
 }
 
 async fn service_token(c: &reqwest::Client) -> String {
@@ -32,282 +95,356 @@ async fn service_token(c: &reqwest::Client) -> String {
         .json(&json!({ "client_secret": SERVICE_SECRET }))
         .send()
         .await
-        .expect("service-token request");
+        .unwrap();
     assert!(
         resp.status().is_success(),
         "service-token: {}",
         resp.status()
     );
-    resp.json::<Value>().await.unwrap()["access_token"]
-        .as_str()
-        .unwrap()
-        .to_string()
+    let v: Value = resp.json().await.unwrap();
+    v["access_token"].as_str().unwrap().to_string()
 }
 
-// A logged-in customer token, to prove the service plane rejects it. Uses the
-// same registration payload shape as tests/finance.rs (phone_number + sin).
-async fn customer_token(c: &reqwest::Client) -> String {
-    let n = Uuid::new_v4().as_u128();
-    let email = format!("botest_{}@example.com", n % 1_000_000_000);
-    let reg = c
-        .post(format!("{}/api/v1/customers", base_url()))
-        .json(&json!({
-            "email": email,
-            "phone_number": format!("{:010}", n % 10_000_000_000u128),
-            "first_name": "Bo",
-            "last_name": "Tester",
-            "date_of_birth": "1990-01-01",
-            "sin": format!("{:09}", n % 1_000_000_000),
-            "password": TEST_PASSWORD
-        }))
-        .send()
-        .await
-        .expect("register");
-    assert!(reg.status().is_success(), "register: {}", reg.status());
+async fn create_account(c: &reqwest::Client, token: &str, account_type: &str) -> Uuid {
     let resp = c
-        .post(format!("{}/api/v1/auth/login", base_url()))
-        .json(&json!({ "email": email, "password": TEST_PASSWORD }))
+        .post(format!("{}/api/v1/accounts", base_url()))
+        .bearer_auth(token)
+        .json(&json!({ "account_type": account_type }))
         .send()
         .await
-        .expect("login");
-    assert!(resp.status().is_success(), "login: {}", resp.status());
-    resp.json::<Value>().await.unwrap()["access_token"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
-
-#[tokio::test]
-async fn float_returns_system_accounts_for_a_service_token() {
-    let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
-
-    let resp = c
-        .get(format!("{}/api/v1/back-office/ops/float", base_url()))
-        .bearer_auth(&svc)
-        .send()
-        .await
-        .expect("float request");
-    assert!(resp.status().is_success(), "float: {}", resp.status());
-
-    let body = resp.json::<Value>().await.unwrap();
-    let accounts = body["accounts"].as_array().expect("accounts array");
-    assert!(
-        !accounts.is_empty(),
-        "expected the bootstrapped system accounts"
-    );
-    assert!(
-        accounts.iter().any(|a| a["system"] == "system"),
-        "expected a system@ (VISA_CLEARING/BANK_SETTLEMENT) entry, got {accounts:?}"
-    );
-    assert!(
-        body["total_float"].is_string(),
-        "total_float should be a decimal string"
-    );
-}
-
-#[tokio::test]
-async fn float_rejects_a_customer_token() {
-    let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let cust = customer_token(&c).await;
-
-    let resp = c
-        .get(format!("{}/api/v1/back-office/ops/float", base_url()))
-        .bearer_auth(&cust)
-        .send()
-        .await
-        .expect("float request");
-    assert_eq!(
-        resp.status().as_u16(),
-        403,
-        "customer token must be refused on the service plane"
-    );
-}
-
-#[tokio::test]
-async fn transactions_summary_returns_grouped_shape() {
-    let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
-
-    let resp = c
-        .get(format!(
-            "{}/api/v1/back-office/ops/transactions?window=7d",
-            base_url()
-        ))
-        .bearer_auth(&svc)
-        .send()
-        .await
-        .expect("transactions request");
+        .unwrap();
     assert!(
         resp.status().is_success(),
-        "transactions: {}",
+        "create account: {}",
         resp.status()
     );
-
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body["window"], "7d");
-    assert!(
-        body["since"].is_string(),
-        "since should be an rfc3339 string"
-    );
-    assert!(body["groups"].is_array(), "groups should be an array");
+    let v: Value = resp.json().await.unwrap();
+    Uuid::parse_str(v["account_id"].as_str().unwrap()).unwrap()
 }
 
-#[tokio::test]
-async fn transactions_summary_rejects_bad_window() {
-    let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
-
-    let resp = c
-        .get(format!(
-            "{}/api/v1/back-office/ops/transactions?window=1y",
-            base_url()
-        ))
-        .bearer_auth(&svc)
-        .send()
-        .await
-        .expect("transactions request");
-    assert_eq!(
-        resp.status().as_u16(),
-        400,
-        "unsupported window must be a 400"
-    );
+/// A customer plus one chequing account, and both tokens.
+async fn fixture(c: &reqwest::Client) -> (Uuid, Uuid, String, String) {
+    let (customer_id, email) = create_customer(c).await;
+    let customer_token = login(c, &email).await;
+    let account_id = create_account(c, &customer_token, "chequing").await;
+    let svc = service_token(c).await;
+    (customer_id, account_id, customer_token, svc)
 }
 
+// ---------------------------------------------------------------------------
+// The plane guard
+// ---------------------------------------------------------------------------
+
+/// A customer token must be refused on every back-office route.
+///
+/// Enumerated rather than spot-checked: the failure mode is one route added
+/// later with the wrong extractor, and a test that samples two of seven will
+/// not see it.
 #[tokio::test]
-async fn rails_summary_returns_per_rail_groups() {
+async fn customer_tokens_are_refused_on_every_route() {
     let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
+    require_stack!(&c);
 
-    let resp = c
-        .get(format!(
-            "{}/api/v1/back-office/ops/rails?window=30d",
-            base_url()
-        ))
-        .bearer_auth(&svc)
-        .send()
-        .await
-        .expect("rails request");
-    assert!(resp.status().is_success(), "rails: {}", resp.status());
+    let (customer_id, account_id, customer_token, _svc) = fixture(&c).await;
 
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body["window"], "30d");
-    assert!(
-        body["since"].is_string(),
-        "since should be an rfc3339 string"
-    );
-    assert!(
-        body["rails"]["interac"].is_array(),
-        "interac group should be an array"
-    );
-    assert!(
-        body["rails"]["aft"].is_array(),
-        "aft group should be an array"
-    );
-    assert!(
-        body["rails"]["lynx"].is_array(),
-        "lynx group should be an array"
-    );
-}
+    let routes = [
+        bo("/customers"),
+        bo(&format!("/customers/{customer_id}")),
+        bo(&format!("/customers/{customer_id}/accounts")),
+        bo(&format!("/customers/{customer_id}/kyc-documents")),
+        bo(&format!("/accounts/{account_id}")),
+        bo(&format!("/accounts/{account_id}/balance")),
+        bo(&format!("/accounts/{account_id}/transactions")),
+    ];
 
-#[tokio::test]
-async fn exceptions_summary_returns_recorded_counts() {
-    let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
+    for url in routes {
+        let resp = c
+            .get(&url)
+            .bearer_auth(&customer_token)
+            .send()
+            .await
+            .unwrap();
 
-    let resp = c
-        .get(format!(
-            "{}/api/v1/back-office/ops/exceptions?window=30d",
-            base_url()
-        ))
-        .bearer_auth(&svc)
-        .send()
-        .await
-        .expect("exceptions request");
-    assert!(resp.status().is_success(), "exceptions: {}", resp.status());
-
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body["window"], "30d");
-    assert!(
-        body["since"].is_string(),
-        "since should be an rfc3339 string"
-    );
-    let ex = &body["exceptions"];
-    for k in [
-        "failed_transactions",
-        "reversals",
-        "returned_aft_entries",
-        "rejected_aft_entries",
-        "wire_recalls",
-    ] {
-        assert!(
-            ex[k].is_u64(),
-            "exceptions.{k} should be a count, got {:?}",
-            ex[k]
+        // 403, not 401: the token is valid, it is simply the wrong plane. That
+        // is the same distinction the card rails already draw.
+        assert_eq!(
+            resp.status(),
+            403,
+            "a customer token reached {url} — the plane guard is not holding"
         );
     }
 }
 
 #[tokio::test]
-async fn cards_summary_returns_holds_and_txn_groups() {
+async fn unauthenticated_requests_are_refused() {
     let c = client();
-    if !stack_up(&c).await {
-        eprintln!("stack down; skipping");
-        return;
-    }
-    let svc = service_token(&c).await;
+    require_stack!(&c);
+
+    let resp = c.get(bo("/customers")).send().await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_service_token_reads_any_customer() {
+    let c = client();
+    require_stack!(&c);
+
+    let (customer_id, _account, _cust, svc) = fixture(&c).await;
 
     let resp = c
-        .get(format!(
-            "{}/api/v1/back-office/ops/cards?window=30d",
-            base_url()
-        ))
+        .get(bo(&format!("/customers/{customer_id}")))
         .bearer_auth(&svc)
         .send()
         .await
-        .expect("cards request");
-    assert!(resp.status().is_success(), "cards: {}", resp.status());
+        .unwrap();
+    assert!(resp.status().is_success(), "status {}", resp.status());
 
-    let body = resp.json::<Value>().await.unwrap();
-    assert_eq!(body["window"], "30d");
-    assert!(
-        body["since"].is_string(),
-        "since should be an rfc3339 string"
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["customer_id"].as_str().unwrap(), customer_id.to_string());
+
+    // The response type drops these. A back-office system has no more need of a
+    // social insurance number than the consumer app does.
+    assert!(v.get("sin").is_none(), "sin must never be exposed");
+    assert!(v.get("date_of_birth").is_none());
+}
+
+#[tokio::test]
+async fn an_unknown_customer_is_404() {
+    let c = client();
+    require_stack!(&c);
+
+    let svc = service_token(&c).await;
+    let resp = c
+        .get(bo(&format!("/customers/{}", Uuid::new_v4())))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn customers_are_searchable_by_email() {
+    let c = client();
+    require_stack!(&c);
+
+    let (customer_id, email) = create_customer(&c).await;
+    let svc = service_token(&c).await;
+
+    // Email is the only identifier a back-office system reliably holds, so this
+    // is the join key in practice.
+    let v: Value = c
+        .get(bo(&format!("/customers?email={email}")))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = v.as_array().expect("expected an array");
+    assert_eq!(rows.len(), 1, "expected exactly one match for {email}");
+    assert_eq!(
+        rows[0]["customer_id"].as_str().unwrap(),
+        customer_id.to_string()
     );
+}
+
+#[tokio::test]
+async fn the_customer_list_clamps_its_limit() {
+    let c = client();
+    require_stack!(&c);
+
+    let svc = service_token(&c).await;
+
+    // Without the clamp this endpoint is a whole-table dump, which is a very
+    // different thing to hand a back-office integration.
+    let v: Value = c
+        .get(bo("/customers?limit=100000"))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert!(v.as_array().unwrap().len() <= 100);
+}
+
+// ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn accounts_are_listed_for_any_customer() {
+    let c = client();
+    require_stack!(&c);
+
+    let (customer_id, account_id, _cust, svc) = fixture(&c).await;
+
+    let v: Value = c
+        .get(bo(&format!("/customers/{customer_id}/accounts")))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let rows = v.as_array().unwrap();
+    assert!(rows
+        .iter()
+        .any(|a| a["account_id"].as_str().unwrap() == account_id.to_string()));
+
+    // The list is a summary, matching the consumer plane: no available_balance.
+    // Keeping it narrow stops a list view becoming the authoritative source for
+    // a figure it only half-fetched.
+    assert!(rows[0].get("available_balance").is_none());
+}
+
+#[tokio::test]
+async fn money_is_still_serialised_as_a_string() {
+    let c = client();
+    require_stack!(&c);
+
+    let (_customer, account_id, _cust, svc) = fixture(&c).await;
+
+    let v: Value = c
+        .get(bo(&format!("/accounts/{account_id}/balance")))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Downstream consumers parse this as a decimal string. If rust_decimal ever
+    // gains `serde-float`, every one of them starts silently rounding.
     assert!(
-        body["authorization_holds"]["open_count"].is_u64(),
-        "open_count should be a count"
+        v["balance"].is_string(),
+        "balance should be a string, got {:?}",
+        v["balance"]
     );
-    assert!(
-        body["authorization_holds"]["open_amount"].is_string(),
-        "open_amount should be a decimal string"
-    );
-    assert!(
-        body["card_transactions"].is_array(),
-        "card_transactions should be an array"
-    );
+    assert!(v["holds"].is_array());
+}
+
+#[tokio::test]
+async fn an_unknown_account_is_404() {
+    let c = client();
+    require_stack!(&c);
+
+    let svc = service_token(&c).await;
+    for suffix in ["", "/balance", "/transactions"] {
+        let resp = c
+            .get(bo(&format!("/accounts/{}{suffix}", Uuid::new_v4())))
+            .bearer_auth(&svc)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "unknown account{suffix}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn transaction_history_is_pinned_to_the_path_account() {
+    let c = client();
+    require_stack!(&c);
+
+    let (_customer, account_id, customer_token, svc) = fixture(&c).await;
+    let other = create_account(&c, &customer_token, "savings").await;
+
+    // Passing ?account_id= for a *different* account must not widen the scope:
+    // the path wins. Otherwise the URL stops describing what it returns.
+    let v: Value = c
+        .get(bo(&format!(
+            "/accounts/{account_id}/transactions?account_id={other}"
+        )))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    for txn in v["transactions"].as_array().unwrap() {
+        let touches_path_account = txn["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["account_id"].as_str().unwrap() == account_id.to_string());
+        assert!(
+            touches_path_account,
+            "history leaked a transaction that does not touch {account_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn transaction_history_has_the_pagination_envelope() {
+    let c = client();
+    require_stack!(&c);
+
+    let (_customer, account_id, _cust, svc) = fixture(&c).await;
+
+    let v: Value = c
+        .get(bo(&format!("/accounts/{account_id}/transactions?limit=5")))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The same envelope as the consumer plane, so a caller learns one shape.
+    assert!(v["transactions"].is_array());
+    assert!(v["total_count"].is_number());
+    assert!(v["has_more"].is_boolean());
+}
+
+// ---------------------------------------------------------------------------
+// KYC documents
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn kyc_documents_are_readable_and_omit_the_file_path() {
+    let c = client();
+    require_stack!(&c);
+
+    let (customer_id, _account, _cust, svc) = fixture(&c).await;
+
+    let resp = c
+        .get(bo(&format!("/customers/{customer_id}/kyc-documents")))
+        .bearer_auth(&svc)
+        .send()
+        .await
+        .unwrap();
+
+    // A fresh customer has none — the point is that the route answers at all.
+    // Before this plane, `kyc_documents` had no read path in the API.
+    assert!(resp.status().is_success(), "status {}", resp.status());
+
+    let v: Value = resp.json().await.unwrap();
+    for doc in v.as_array().unwrap() {
+        // A back-office system needs to know a passport was verified, not where
+        // the scan of it lives.
+        assert!(
+            doc.get("file_path").is_none(),
+            "file_path must not be exposed"
+        );
+    }
 }

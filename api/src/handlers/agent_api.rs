@@ -22,7 +22,7 @@ use uuid::Uuid;
 use validator::Validate;
 
 use crate::errors::AppError;
-use crate::handlers::cards::normalize_amount;
+use crate::handlers::cards::{normalize_amount, Tx};
 use crate::handlers::transactions::{
     execute_transfer, fetch_history, find_by_idempotency_key, load_transaction_response,
     AgentTransferCtx, TransferSpec,
@@ -216,16 +216,30 @@ async fn post_mandated_transfer(
             // failures (insufficient funds, inoperable account, a revocation
             // racing the reservation) with the error's code — so the owner's
             // activity view never has blind spots.
+            //
+            // One transaction, on every failure rather than only the step-up
+            // ones. Two autocommit writes in sequence let a park failure leave
+            // an `agent_actions` row describing a step-up that no
+            // `pending_approvals` row backs (#36 item 1), and since #39 that
+            // dangling audit is no longer merely internal: the same CTE mirrors
+            // it into `agent_denial_outbox`, so it reaches the fraud engine as
+            // an `agent_denial`. A retry then mints a fresh `action_id`, and
+            // `event_key` derives from it — so the engine would count two
+            // events for one logical attempt, inflating exactly the probing
+            // signal that telemetry exists to measure. Committing the audit
+            // with the ask removes the window rather than compensating for it.
             let reason = transfer_failure_reason(&err);
-            policy::record_action(
-                &state.pool,
+            let decision = policy::decision_for(&reason);
+            let mut tx = state.pool.begin().await.map_err(AppError::Database)?;
+            policy::record_action_tx(
+                &mut tx,
                 agent.mandate_id,
                 agent.agent_id,
                 agent.customer_id,
                 agent.account_id,
                 "transfer",
                 Some(amount),
-                policy::decision_for(&reason),
+                decision,
                 Some(&reason),
                 None,
             )
@@ -235,10 +249,20 @@ async fn post_mandated_transfer(
             // Phase 3: the two cap overruns don't dead-end — they park as a
             // pending approval for the owner to approve/decline, and the agent
             // gets a 202 instead of a 403.
-            if policy::decision_for(&reason) == "step_up_required" {
-                let approval = park_pending_approval(&state, &agent, &req, amount, &reason).await?;
+            if decision == "step_up_required" {
+                let approval = park_pending_approval(
+                    &mut tx,
+                    &agent,
+                    &req,
+                    amount,
+                    &reason,
+                    state.settings.agent.approval_ttl_minutes,
+                )
+                .await?;
+                tx.commit().await.map_err(AppError::Database)?;
                 return Ok((StatusCode::ACCEPTED, Json(approval)).into_response());
             }
+            tx.commit().await.map_err(AppError::Database)?;
             // The audit above kept the true reason; the agent gets one opaque
             // refusal, because a cause-specific one is an oracle (see
             // refusal_for_agent).
@@ -309,25 +333,42 @@ pub(crate) fn transfer_failure_reason(err: &AppError) -> String {
     }
 }
 
-/// Park an over-cap transfer as a pending approval. Race-safe on the partial
-/// unique index (one open ask per mandate + idempotency key): the loser of a
-/// tight duplicate race just reads the winner's row.
+/// Park an over-cap transfer as a pending approval, inside the caller's
+/// transaction so the ask and the audit describing it commit as one unit.
+///
+/// Race-safe on the partial unique index (one open ask per mandate +
+/// idempotency key). `DO UPDATE` rather than `DO NOTHING`, on a no-op
+/// assignment, and the difference is the whole point (#36 item 2): `DO NOTHING`
+/// does not block on an **uncommitted** conflicting row — it returns nothing
+/// immediately, and a follow-up `SELECT` cannot see that row either, so a
+/// benign duplicate race surfaced as a 500 that read like a server fault.
+/// `DO UPDATE` takes the lock, waits for the racing transaction to resolve, and
+/// then returns whichever row won.
+///
+/// The self-assignment is deliberate: it must touch a column to be an UPDATE,
+/// and touching `mandate_id` with its own value changes nothing while leaving
+/// every meaningful field — amount, reason, expiry — as the winner wrote them.
+/// A duplicate must adopt the existing ask, never quietly rewrite it.
+///
+/// Because `DO UPDATE` always returns a row, there is no losing branch left to
+/// handle: the fallback `SELECT` this used to need is gone.
 async fn park_pending_approval(
-    state: &AppState,
+    tx: &mut Tx<'_>,
     agent: &AuthenticatedAgent,
     req: &AgentTransferRequest,
     amount: rust_decimal::Decimal,
     reason: &str,
+    ttl_minutes: i64,
 ) -> Result<AgentApprovalStatus, AppError> {
-    let ttl_minutes = state.settings.agent.approval_ttl_minutes;
-    if let Some(created) = sqlx::query_as::<_, AgentApprovalStatus>(&format!(
+    let parked = sqlx::query_as::<_, AgentApprovalStatus>(&format!(
         "INSERT INTO pending_approvals \
          (mandate_id, agent_id, customer_id, account_id, to_account_id, amount, \
           description, idempotency_key, reason, expires_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, \
                  CURRENT_TIMESTAMP + $10 * INTERVAL '1 minute') \
          ON CONFLICT (mandate_id, idempotency_key) \
-         WHERE status IN ('pending', 'executing') DO NOTHING \
+         WHERE status IN ('pending', 'executing') \
+         DO UPDATE SET mandate_id = pending_approvals.mandate_id \
          RETURNING {AGENT_APPROVAL_COLUMNS}",
     ))
     .bind(agent.mandate_id)
@@ -340,27 +381,13 @@ async fn park_pending_approval(
     .bind(&req.idempotency_key)
     .bind(reason)
     .bind(ttl_minutes)
-    .fetch_optional(&state.pool)
+    .fetch_one(&mut **tx)
     .await
-    .map_err(AppError::Database)?
-    {
-        tracing::info!(approval_id = %created.approval_id, mandate_id = %agent.mandate_id,
-            %amount, reason, "⏸ transfer parked for step-up approval");
-        return Ok(created);
-    }
-    // Lost a tight race: the same ask is already open (parked by a concurrent
-    // duplicate, or mid-execution). No expiry filter here — this is the safety
-    // net after an insert conflict, so return whatever open ask exists.
-    sqlx::query_as::<_, AgentApprovalStatus>(&format!(
-        "SELECT {AGENT_APPROVAL_COLUMNS} FROM pending_approvals \
-         WHERE mandate_id = $1 AND idempotency_key = $2 \
-           AND status IN ('pending', 'executing')",
-    ))
-    .bind(agent.mandate_id)
-    .bind(&req.idempotency_key)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(AppError::Database)
+    .map_err(AppError::Database)?;
+
+    tracing::info!(approval_id = %parked.approval_id, mandate_id = %agent.mandate_id,
+        %amount, reason, "⏸ transfer parked for step-up approval");
+    Ok(parked)
 }
 
 /// Poll the fate of a parked transfer (Phase 3). Pinned to the requesting

@@ -1,0 +1,83 @@
+# Agent-denial outbox drainer.
+#
+# `agent_denial_outbox` is written by the CTE in api/src/policy.rs — the same
+# statement that appends the `agent_actions` audit row it mirrors, so telemetry
+# and record commit together. It has no in-process consumer (the API runs zero
+# background workers by design), so this CronJob is the trigger: each tick mints
+# a service token and POSTs `POST /api/v1/fraud/admin/flush-denials`, which
+# claims undelivered rows race-safely (FOR UPDATE SKIP LOCKED), forwards each to
+# the fraud engine's `POST /v1/outcomes`, and marks them delivered or
+# dead-letters them past the retry cap.
+#
+# Why an outbox rather than posting inline: you cannot atomically write this
+# database and call a remote service. Fire-and-forget would drop events under
+# load — and load is exactly when enumeration probing happens, so the loss would
+# correlate with the attack the telemetry exists to reveal.
+#
+# Delivery is at-least-once, which is safe because each payload carries an
+# `event_key` derived from `action_id`: the engine's outcome ingestion is
+# idempotent on it, so a redelivery collapses instead of double-counting.
+#
+# Cron cadence == detection latency. Five minutes is fine for enumeration
+# patterns, which play out over minutes to hours; tighten it if a rules consumer
+# ever wants to react in closer to real time.
+#
+# With `NANO_BANK__FRAUD__BACKEND=off` (the default kill switch) the endpoint
+# skips without claiming rows, so this CronJob is harmless when screening is
+# disabled — it reports the pending backlog and exits.
+#
+# NOTE: `client-secret` below must match the bank-api's
+# `security.service_client_secret`, same caveat as the Interac drainer Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fraud-drainer-secret
+  namespace: nano-bank
+type: Opaque
+stringData:
+  # Must equal bank-api's security.service_client_secret.
+  client-secret: "nano-bank-visa-network-secret-change-me"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fraud-denial-drainer
+  namespace: nano-bank
+spec:
+  schedule: "*/5 * * * *" # every 5 minutes; tighten for lower detection latency
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Give a tick a bounded lifetime so a wedged curl can't hold the slot.
+      activeDeadlineSeconds: 120
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: drainer
+              image: curlimages/curl:8.11.1
+              env:
+                - name: API_BASE
+                  value: "http://bank-api:8081"
+                - name: CLIENT_SECRET
+                  valueFrom:
+                    secretKeyRef:
+                      name: fraud-drainer-secret
+                      key: client-secret
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  # 1) mint a short-lived service token
+                  token=$(curl -fsS -X POST "$API_BASE/api/v1/auth/service-token" \
+                    -H 'content-type: application/json' \
+                    -d "{\"client_secret\":\"$CLIENT_SECRET\"}" \
+                    | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+                  if [ -z "$token" ]; then echo "failed to obtain service token" >&2; exit 1; fi
+                  # 2) drain the outbox to the fraud engine
+                  curl -fsS -X POST "$API_BASE/api/v1/fraud/admin/flush-denials" \
+                    -H "Authorization: Bearer $token"
+                  echo

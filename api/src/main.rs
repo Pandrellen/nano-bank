@@ -8,6 +8,7 @@ mod ledger;
 mod lynx;
 mod middleware;
 mod models;
+mod outbox;
 mod policy;
 mod rails;
 mod repositories;
@@ -179,10 +180,6 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
         )
         // Account routes
         .nest("/api/v1/accounts", handlers::accounts::account_routes())
-        .nest(
-            "/api/v1/back-office",
-            handlers::back_office::back_office_routes(),
-        )
         // Agentic banking: agent registration/metadata, consent mandates, and
         // the mandate-scoped agent surface (no account params — the mandate
         // pins the account)
@@ -191,10 +188,17 @@ async fn create_router(pool: config::database::DatabasePool, settings: &Settings
         .nest("/api/v1/agent", handlers::agent_api::agent_api_routes())
         // Step-up approvals (Phase 3): the customer resolves parked transfers
         .nest("/api/v1/approvals", handlers::approvals::approval_routes())
+        // Back-office read plane: service-token reads *across* customers, for a
+        // CRM or support console. Read-only by design — see the module docs.
+        .nest(
+            "/api/v1/back-office",
+            handlers::back_office::back_office_routes(),
+        )
         // Credit-card payment rails (issuer endpoints)
         .nest("/api/v1/cards", handlers::cards::card_routes())
         // Interest / NIM engine (spec #2): daily accrual + monthly capitalisation
         .nest("/api/v1/finance", handlers::finance::finance_routes())
+        .nest("/api/v1/fraud", handlers::fraud_admin::fraud_admin_routes())
         // Interac e-Transfer rails
         .nest("/api/v1/interac", handlers::interac::interac_routes())
         .nest("/api/v1/aft", handlers::aft::aft_routes())
@@ -232,6 +236,7 @@ fn build_fraud_check(settings: &Settings) -> std::sync::Arc<dyn fraud::FraudChec
                 settings.fraud.engine_url.clone(),
                 settings.fraud.service_token.clone(),
                 settings.fraud.timeout_ms,
+                settings.fraud.outcomes_timeout_ms,
             ))
         }
         other => {
