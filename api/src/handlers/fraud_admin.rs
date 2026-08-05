@@ -14,7 +14,12 @@
 //! the same shape as the Interac notification drainer — and now literally the
 //! same claim, which both take from [`crate::outbox::OutboxClaim`].
 
-use axum::{extract::State, response::Json, routing::post, Router};
+use axum::{
+    extract::{Path, State},
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use uuid::Uuid;
 
 use crate::config::database::DatabasePool;
@@ -42,7 +47,86 @@ const DELIVERED_RETENTION_DAYS: i32 = 7;
 const UNDELIVERED_RETENTION_DAYS: i32 = 30;
 
 pub fn fraud_admin_routes() -> Router<AppState> {
-    Router::new().route("/admin/flush-denials", post(flush_denials))
+    Router::new()
+        .route("/admin/flush-denials", post(flush_denials))
+        .route(
+            "/admin/transactions/:transaction_id/fraud-link",
+            get(fraud_link),
+        )
+}
+
+/// The engine's identifiers for one screened money row.
+///
+/// Both ids are `null` for a transaction that was never screened — see
+/// [`fraud_link`].
+#[derive(serde::Serialize)]
+struct FraudLinkResponse {
+    transaction_id: Uuid,
+    operation_id: Option<Uuid>,
+    decision_id: Option<Uuid>,
+    /// Screening failed open: the engine was unreachable and the movement
+    /// proceeded anyway. The decision may not exist engine-side, so a caller
+    /// joining on `operation_id` should expect a miss rather than treat one as
+    /// an error.
+    failed_open: bool,
+}
+
+/// Look up the fraud engine's `operation_id` for a bank transaction.
+///
+/// **Why this exists.** The engine joins ground truth to decisions on
+/// `outcome_events.operation_id = decisions.operation_id`; its `decisions` table
+/// has no `transaction_id` column, because the bank mints that inside its own
+/// transaction *after* the fraud check. So `operation_id` is the only key that
+/// can attach an outcome to a decision — and until now it never left the bank.
+/// It was written to `transactions.metadata.fraud` and read by nobody, so no
+/// decision could be labelled and the engine's training-set export returned zero
+/// rows however much traffic ran (#46).
+///
+/// **Why an endpoint rather than a response field.** `operation_id` and
+/// `decision_id` are fraud-engine internals. Putting them on
+/// `TransactionResponse` would publish them to the customer plane — the
+/// disclosure concern #34's review raised about echoing bank internals. A
+/// service-token route keeps the whole concern on the service plane behind one
+/// auth check, instead of a field whose presence depends on who is asking.
+///
+/// **Not customer-scoped**, deliberately: the caller is the fraud operator, not
+/// an account holder.
+async fn fraud_link(
+    State(state): State<AppState>,
+    Path(transaction_id): Path<Uuid>,
+    _svc: AuthenticatedService,
+) -> Result<Json<FraudLinkResponse>, AppError> {
+    // `metadata` is nullable, so the outer Option is "no such transaction" and
+    // the inner one is "transaction exists, metadata NULL". Only the former is a
+    // 404.
+    let metadata: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT metadata FROM transactions WHERE transaction_id = $1")
+            .bind(transaction_id)
+            .fetch_optional(&state.pool)
+            .await?
+            .ok_or_else(|| AppError::NotFound("transaction not found".to_string()))?;
+
+    // A transaction with no `fraud` metadata was never screened — screening was
+    // off, or the rail does not screen. That is a real answer, so it is a 200
+    // with nulls rather than a 404: a 404 would invite the caller to retry
+    // something that is never going to appear.
+    let fraud = metadata.as_ref().and_then(|m| m.get("fraud"));
+    let uuid_at = |key: &str| -> Option<Uuid> {
+        fraud
+            .and_then(|f| f.get(key))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|s| s.parse().ok())
+    };
+
+    Ok(Json(FraudLinkResponse {
+        transaction_id,
+        operation_id: uuid_at("operation_id"),
+        decision_id: uuid_at("decision_id"),
+        failed_open: fraud
+            .and_then(|f| f.get("failed_open"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }))
 }
 
 #[derive(sqlx::FromRow)]

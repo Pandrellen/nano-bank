@@ -565,3 +565,160 @@ async fn engine_mode_retried_rail_send_is_not_rescreened() {
         }
     }
 }
+
+/// Mint a service-plane token — the fraud operator's identity.
+async fn service_token(c: &reqwest::Client) -> String {
+    let r = c
+        .post(format!("{}/api/v1/auth/service-token", base_url()))
+        .json(&json!({ "client_secret": "nano-bank-visa-network-secret-change-me" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "service-token: {}", r.status());
+    let v: Value = r.json().await.unwrap();
+    v["access_token"].as_str().unwrap().to_string()
+}
+
+async fn fraud_link(c: &reqwest::Client, token: &str, txn: Uuid) -> reqwest::Response {
+    c.get(format!(
+        "{}/api/v1/fraud/admin/transactions/{txn}/fraud-link",
+        base_url()
+    ))
+    .bearer_auth(token)
+    .send()
+    .await
+    .unwrap()
+}
+
+/// Tier 2 — engine mode: the linkage endpoint hands the engine's `operation_id`
+/// to a service caller (#46).
+///
+/// This is the key the whole label path turns on. The engine joins ground truth
+/// on `outcome_events.operation_id = decisions.operation_id` and has no
+/// `transaction_id` column to fall back on, so until this endpoint existed the
+/// id was written to `transactions.metadata` and read by nobody — no decision
+/// could be labelled, and the training-set export returned zero rows.
+///
+/// Asserted against the database rather than merely "is a UUID": the endpoint
+/// returning *some* well-formed id that isn't the one the engine recorded would
+/// be worse than returning nothing, because every downstream label would attach
+/// to the wrong decision.
+#[tokio::test]
+async fn fraud_link_exposes_the_engine_operation_id_to_a_service_caller() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, format!("dev-{}", Uuid::new_v4()).as_str()).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+    let resp = transfer(&c, &token, from, to, 40.0).await;
+    assert!(resp.status().is_success(), "transfer: {}", resp.status());
+    let v: Value = resp.json().await.unwrap();
+    let txn_id = Uuid::parse_str(v["transaction_id"].as_str().unwrap()).unwrap();
+
+    // The customer plane must not carry it — that is the disclosure decision
+    // this endpoint exists to honour (#46: service plane only).
+    assert!(
+        v.get("metadata").is_none_or(Value::is_null),
+        "engine ids must not reach the customer plane: {v}"
+    );
+
+    let svc = service_token(&c).await;
+    let link = fraud_link(&c, &svc, txn_id).await;
+    assert_eq!(link.status().as_u16(), 200);
+    let link: Value = link.json().await.unwrap();
+
+    let Some(pool) = test_db().await else { return };
+    let (op_id, decision_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT metadata->'fraud'->>'operation_id', metadata->'fraud'->>'decision_id' \
+         FROM transactions WHERE transaction_id = $1",
+    )
+    .bind(txn_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        link["operation_id"].as_str(),
+        op_id.as_deref(),
+        "must return the id the engine actually recorded: {link}"
+    );
+    assert_eq!(link["decision_id"].as_str(), decision_id.as_deref());
+    assert_eq!(link["transaction_id"].as_str().unwrap(), txn_id.to_string());
+}
+
+/// The linkage is service-plane only: a customer token is refused even for the
+/// customer's own transaction. Without this the endpoint would be a way to read
+/// engine internals from the customer plane — the thing #46 chose against.
+#[tokio::test]
+async fn fraud_link_refuses_a_customer_token() {
+    let c = client();
+    require_stack!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, format!("dev-{}", Uuid::new_v4()).as_str()).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+    let resp = transfer(&c, &token, from, to, 25.0).await;
+    assert!(resp.status().is_success());
+    let v: Value = resp.json().await.unwrap();
+    let txn_id = Uuid::parse_str(v["transaction_id"].as_str().unwrap()).unwrap();
+
+    let status = fraud_link(&c, &token, txn_id).await.status().as_u16();
+    assert_eq!(status, 403, "a customer token is the wrong plane");
+}
+
+/// An unscreened transaction answers 200 with nulls, not 404.
+///
+/// "This transaction has no fraud link" is a true answer — screening is off by
+/// default, and several rails do not screen at all. A 404 would tell a caller
+/// the transaction does not exist and invite it to retry something that is never
+/// going to appear.
+///
+/// Runs WITHOUT `require_fraud_e2e`: it needs the backend off, which is the
+/// shipped default, so this is the one linkage test that exercises the
+/// unscreened branch.
+#[tokio::test]
+async fn fraud_link_is_null_for_an_unscreened_transaction() {
+    let c = client();
+    require_stack!(&c);
+    if std::env::var("FRAUD_E2E").as_deref() == Ok("1") {
+        eprintln!("SKIP: needs the fraud backend off (the default)");
+        return;
+    }
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, format!("dev-{}", Uuid::new_v4()).as_str()).await;
+    let from = create_account(&c, &token).await;
+    let to = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, from, 500.0).await.is_none() {
+        return;
+    }
+    let resp = transfer(&c, &token, from, to, 30.0).await;
+    assert!(resp.status().is_success());
+    let v: Value = resp.json().await.unwrap();
+    let txn_id = Uuid::parse_str(v["transaction_id"].as_str().unwrap()).unwrap();
+
+    let svc = service_token(&c).await;
+    let link = fraud_link(&c, &svc, txn_id).await;
+    assert_eq!(link.status().as_u16(), 200, "unscreened is not 'not found'");
+    let link: Value = link.json().await.unwrap();
+    assert!(link["operation_id"].is_null(), "{link}");
+    assert!(link["decision_id"].is_null(), "{link}");
+    assert_eq!(link["failed_open"], false);
+}
+
+/// An unknown transaction is a 404 — the one case that IS "not found".
+#[tokio::test]
+async fn fraud_link_404s_for_an_unknown_transaction() {
+    let c = client();
+    require_stack!(&c);
+    let svc = service_token(&c).await;
+    let status = fraud_link(&c, &svc, Uuid::new_v4()).await.status().as_u16();
+    assert_eq!(status, 404);
+}
