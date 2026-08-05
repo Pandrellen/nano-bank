@@ -1,9 +1,8 @@
-import TokenCountdown from "@/components/TokenCountdown";
-import { decodeJwtExpiry } from "@/lib/jwt";
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
 import { PiggyBank, Wallet, ArrowLeft, AlertCircle, Plus } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
+import { Account } from "@/lib/accounts";
 import Link from "next/link";
 
 export const metadata: Metadata = {
@@ -14,7 +13,7 @@ export default async function AccountsPage() {
     const { accessToken } = await requireSession();
 
     // Fetch accounts
-    let accounts: any[] = [];
+    let accounts: Account[] = [];
     let fetchError = false;
     try {
         const response = await fetch(`${API_BASE_URL}/api/v1/accounts`, {

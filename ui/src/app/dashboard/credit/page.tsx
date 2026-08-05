@@ -1,7 +1,8 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { CreditCard as CardIcon, ArrowLeft, AlertCircle } from "lucide-react";
+import { ArrowLeft, AlertCircle } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
+import { Account } from "@/lib/accounts";
 import Link from "next/link";
 
 export const metadata: Metadata = {
@@ -12,7 +13,7 @@ export default async function CreditCardsPage() {
     const { accessToken, profile } = await requireSession();
 
     // Fetch accounts
-    let accounts: any[] = [];
+    let accounts: Account[] = [];
     let fetchError = false;
     try {
         const response = await fetch(`${API_BASE_URL}/api/v1/accounts`, {
@@ -36,11 +37,11 @@ export default async function CreditCardsPage() {
     );
 
     // Fetch complete details for each credit card to obtain credit limit and available balance
-    let creditCardsDetails: any[] = [];
+    let creditCardsDetails: Account[] = [];
     if (!fetchError && creditCardAccounts.length > 0) {
         try {
             const details = await Promise.all(
-                creditCardAccounts.map(async (card) => {
+                creditCardAccounts.map(async (card): Promise<Account | null> => {
                     const response = await fetch(`${API_BASE_URL}/api/v1/accounts/${card.account_id}`, {
                         headers: { Authorization: `Bearer ${accessToken}` },
                         cache: "no-store",
@@ -51,7 +52,7 @@ export default async function CreditCardsPage() {
                     return null;
                 })
             );
-            creditCardsDetails = details.filter(Boolean);
+            creditCardsDetails = details.filter((card): card is Account => card !== null);
         } catch (error) {
             console.error("Failed to fetch card details:", error);
             fetchError = true;
