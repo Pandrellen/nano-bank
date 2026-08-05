@@ -1,8 +1,11 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { ArrowLeft, AlertCircle } from "lucide-react";
+import { AlertCircle } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
 import { Account } from "@/lib/accounts";
+import BackLink from "@/components/BackLink";
+import GlassCard from "@/components/GlassCard";
+import GradientHeading from "@/components/GradientHeading";
 import Link from "next/link";
 
 export const metadata: Metadata = {
@@ -80,19 +83,13 @@ export default async function CreditCardsPage() {
     return (
         <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 py-12">
             <div className="w-full max-w-3xl">
-                {/* Back Button */}
-                <Link href="/dashboard" className="inline-flex items-center gap-2 text-slate-400 hover:text-white transition-colors text-sm mb-6 group">
-                    <ArrowLeft className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" />
-                    Back to Dashboard
-                </Link>
+                <BackLink href="/dashboard">Back to Dashboard</BackLink>
 
                 {/* Main Content Card */}
-                <div className="w-full bg-gradient-to-br from-white/10 to-white/5 border border-white/15 backdrop-blur-xl rounded-2xl p-8 shadow-[0_20px_50px_rgba(0,0,0,0.5)]">
+                <GlassCard>
                     <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b border-white/10 pb-6">
                         <div>
-                            <h1 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-100 to-nanobank-blue-sky bg-clip-text text-transparent">
-                                Credit Cards
-                            </h1>
+                            <GradientHeading>Credit Cards</GradientHeading>
                         </div>
                         <div className="text-right">
                             <span className="text-slate-400 text-xs font-semibold uppercase tracking-wider">
@@ -205,7 +202,7 @@ export default async function CreditCardsPage() {
                             })}
                         </div>
                     )}
-                </div>
+                </GlassCard>
             </div>
         </main>
     );
