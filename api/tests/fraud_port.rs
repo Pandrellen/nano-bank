@@ -722,3 +722,75 @@ async fn fraud_link_404s_for_an_unknown_transaction() {
     let status = fraud_link(&c, &svc, Uuid::new_v4()).await.status().as_u16();
     assert_eq!(status, 404);
 }
+
+/// **Known gap, pinned:** a screened rail movement is indistinguishable from an
+/// unscreened one through this endpoint (#52).
+///
+/// Interac, AFT and Lynx create real `transactions` rows via
+/// `rails/common.rs::new_txn`, and their handlers *do* call `screen()`. What
+/// they don't do is stamp `metadata.fraud`, so the linkage is never stored and
+/// the lookup returns nulls — byte-identical to a transaction that was never
+/// screened at all. A consumer reading a null as "no decision existed" will
+/// under-count screened traffic, which is the blindness #46 was filed over.
+///
+/// This test asserts today's behaviour rather than the desired one, on purpose:
+/// when #52 stamps the linkage it will fail, forcing whoever fixes it to update
+/// the expectation deliberately instead of discovering the coupling by accident.
+#[tokio::test]
+async fn fraud_link_cannot_yet_see_a_screened_rail_movement() {
+    let c = client();
+    require_stack!(&c);
+    require_fraud_e2e!(&c);
+    let (_, email) = create_customer(&c).await;
+    let token = login_with_device(&c, &email, format!("dev-{}", Uuid::new_v4()).as_str()).await;
+    let account = create_account(&c, &token).await;
+    if seed_deposit(&c, &token, account, 5000.0).await.is_none() {
+        return;
+    }
+
+    // An Interac send: screened by `interac.rs`, and it writes an `interac_hold`
+    // row through `new_txn`. The rail returns an `etransfer_id`, not a
+    // transaction id — the row it wrote is what this test is about.
+    let sent = c
+        .post(format!("{}/api/v1/interac/etransfers", base_url()))
+        .bearer_auth(&token)
+        .json(&json!({
+            "from_account_id": account,
+            "amount": 60.00,
+            "recipient_handle_type": "email",
+            "recipient_handle_value": format!("gap-{}@example.com", Uuid::new_v4()),
+            "security_question": "q",
+            "security_answer": "a",
+            "idempotency_key": format!("gap-{}", Uuid::new_v4()),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(sent.status().is_success(), "interac send: {}", sent.status());
+
+    let Some(pool) = test_db().await else { return };
+    let row: Option<(Uuid, Option<Value>)> = sqlx::query_as(
+        "SELECT transaction_id, metadata FROM transactions \
+         WHERE transaction_type LIKE 'interac\\_%' ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let Some((txn_id, metadata)) = row else {
+        panic!("the Interac send must have written a transactions row");
+    };
+    assert!(
+        metadata.as_ref().and_then(|m| m.get("fraud")).is_none(),
+        "precondition: the rail stores no fraud linkage yet — if this fails, \
+         #52 has landed and this test should now assert the ids are present"
+    );
+
+    let svc = service_token(&c).await;
+    let link = fraud_link(&c, &svc, txn_id).await;
+    assert_eq!(link.status().as_u16(), 200);
+    let link: Value = link.json().await.unwrap();
+    assert!(
+        link["operation_id"].is_null(),
+        "pinning today's gap: a screened rail movement reads as unscreened {link}"
+    );
+}

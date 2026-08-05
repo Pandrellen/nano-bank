@@ -55,10 +55,10 @@ pub fn fraud_admin_routes() -> Router<AppState> {
         )
 }
 
-/// The engine's identifiers for one screened money row.
+/// The engine's identifiers for one money row, where the bank persisted them.
 ///
-/// Both ids are `null` for a transaction that was never screened — see
-/// [`fraud_link`].
+/// **A null is not evidence that no decision exists** — see [`fraud_link`] for
+/// the two different states it collapses.
 #[derive(serde::Serialize)]
 struct FraudLinkResponse {
     transaction_id: Uuid,
@@ -91,6 +91,34 @@ struct FraudLinkResponse {
 ///
 /// **Not customer-scoped**, deliberately: the caller is the fraud operator, not
 /// an account holder.
+///
+/// # What a null means — three states, and this response distinguishes two
+///
+/// | State | Response | Reachable? |
+/// |---|---|---|
+/// | Screened, link persisted | ids present | yes |
+/// | Never screened (`backend = "off"`) | nulls | nothing to reach |
+/// | **Screened, link not persisted** | **nulls** | **no — but a decision exists** |
+///
+/// The third row is the trap. Interac, AFT, Lynx and card movements *do* create
+/// `transactions` rows (`rails/common.rs::new_txn`, `cards.rs`) and *do* call
+/// `fraud::gate::screen()` — they simply write `metadata` without a `fraud` key,
+/// so the linkage is never stored. Their decisions are real, may be **blocks**,
+/// and are unreachable through this endpoint.
+///
+/// So: **a null is not evidence that no decision exists.** A consumer that reads
+/// it that way — the label pipeline especially — will treat screened traffic as
+/// unscreened and silently under-count, which is the same blindness #46 was
+/// filed over.
+///
+/// The two null states are not distinguishable here, and deliberately are not
+/// guessed at: the bank records nowhere whether a movement was screened, so any
+/// discriminator would be an inference dressed as a contract. Sniffing
+/// `metadata->'rail'` is the tempting one and it is wrong — card transactions
+/// carry no `rail` key, so they would be misreported as never screened.
+/// Recording the fact properly is #52 (stamp `metadata.fraud` in `new_txn` and
+/// `cards.rs`); until then this endpoint is complete for `transactions.rs`
+/// paths — deposit, withdrawal, transfer — and honest about the rest.
 async fn fraud_link(
     State(state): State<AppState>,
     Path(transaction_id): Path<Uuid>,
@@ -106,10 +134,10 @@ async fn fraud_link(
             .await?
             .ok_or_else(|| AppError::NotFound("transaction not found".to_string()))?;
 
-    // A transaction with no `fraud` metadata was never screened — screening was
-    // off, or the rail does not screen. That is a real answer, so it is a 200
-    // with nulls rather than a 404: a 404 would invite the caller to retry
-    // something that is never going to appear.
+    // No `fraud` metadata is a real answer, so it is a 200 with nulls rather
+    // than a 404 — a 404 would invite the caller to retry something that is
+    // never going to appear. But see the doc comment: nulls collapse two
+    // different states, and only one of them means "no decision".
     let fraud = metadata.as_ref().and_then(|m| m.get("fraud"));
     let uuid_at = |key: &str| -> Option<Uuid> {
         fraud
