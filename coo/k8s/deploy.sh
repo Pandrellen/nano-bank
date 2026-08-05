@@ -4,7 +4,8 @@
 # up in the cluster:
 #   - bank-api   (k8s/deploy.sh)      — the operations MCP reads it over HTTP
 #   - agent-qdrant (agent/k8s/qdrant.yaml) — COO durable memory (best-effort)
-#   - nano-agent-secrets              — provides OLLAMA_API_KEY (minted here if absent)
+#   - nano-agent-secrets              — provides OLLAMA_API_KEY + SERVICE_CLIENT_SECRET
+#                                       (minted here if absent)
 #
 # Note on data: a COO review is grounded but reads ZERO until money has moved.
 # Seeding non-zero activity needs a GL core for the Ledger port to post to (the
@@ -19,16 +20,28 @@ docker build -t nano-operations-mcp:dev operations
 docker build -t nano-coo:dev            coo
 kind load docker-image nano-operations-mcp:dev nano-coo:dev --name nano-bank
 
+# The service secret is a shared credential with the bank's service plane; the
+# operations MCP now fails loudly if it is unset (config.py), so it MUST live in
+# the secret. Sourced from .env if present, else the repo's dev default (matches
+# bank-api's built-in default — rotate both for a real deployment).
+SERVICE_CLIENT_SECRET=$(grep -E '^SERVICE_CLIENT_SECRET=' .env 2>/dev/null | cut -d= -f2-)
+: "${SERVICE_CLIENT_SECRET:=nano-bank-visa-network-secret-change-me}"
+
 if ! kubectl --context "$CTX" -n nano-bank get secret nano-agent-secrets >/dev/null 2>&1; then
-  echo "🔐 Minting nano-agent-secrets (OLLAMA_API_KEY from .env)..."
+  echo "🔐 Minting nano-agent-secrets (OLLAMA_API_KEY from .env + SERVICE_CLIENT_SECRET)..."
   [ -f .env ] || { echo "❌ .env missing (need OLLAMA_API_KEY=…)"; exit 1; }
   OLLAMA_API_KEY=$(grep -E '^OLLAMA_API_KEY=' .env | cut -d= -f2-)
   [ -n "$OLLAMA_API_KEY" ] || { echo "❌ OLLAMA_API_KEY empty in .env"; exit 1; }
   kubectl --context "$CTX" create secret generic nano-agent-secrets -n nano-bank \
     --from-literal=OLLAMA_API_KEY="$OLLAMA_API_KEY" \
+    --from-literal=SERVICE_CLIENT_SECRET="$SERVICE_CLIENT_SECRET" \
     --dry-run=client -o yaml | kubectl --context "$CTX" apply -f -
 else
-  echo "🔐 nano-agent-secrets already present — leaving it untouched."
+  echo "🔐 nano-agent-secrets present — ensuring SERVICE_CLIENT_SECRET key is set..."
+  # Idempotently add/refresh just the service-secret key without disturbing
+  # OLLAMA_API_KEY (patch, not recreate).
+  kubectl --context "$CTX" -n nano-bank patch secret nano-agent-secrets \
+    --type merge -p "{\"stringData\":{\"SERVICE_CLIENT_SECRET\":\"$SERVICE_CLIENT_SECRET\"}}"
 fi
 
 echo "📦 Applying manifests..."

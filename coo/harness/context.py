@@ -8,7 +8,7 @@ LLM; `make_context_hook` wires it as a create_react_agent pre_model_hook."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 
-from langchain_core.messages import SystemMessage, RemoveMessage
+from langchain_core.messages import SystemMessage, RemoveMessage, ToolMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 
@@ -27,7 +27,15 @@ class CompactResult:
 def compact(messages, *, threshold: int, summarize_fn, keep_last: int) -> CompactResult:
     if estimate_tokens(messages) <= threshold or len(messages) <= keep_last:
         return CompactResult(compacted=False, kept=list(messages))
-    head, tail = messages[:-keep_last], messages[-keep_last:]
+    split = len(messages) - keep_last
+    # The kept tail must not begin with a ToolMessage whose parent
+    # AIMessage(tool_calls) got summarized into the head — that orphan is an
+    # invalid message sequence and the provider rejects the next model call.
+    # Advance the split past any leading ToolMessages so the tail starts on a
+    # self-contained boundary (they fold into the summarized head instead).
+    while split < len(messages) and isinstance(messages[split], ToolMessage):
+        split += 1
+    head, tail = messages[:split], messages[split:]
     return CompactResult(compacted=True, kept=list(tail), dropped=list(head),
                          summary=summarize_fn(head))
 
@@ -38,7 +46,8 @@ _SUMMARY_INSTRUCTION = (
     "Facts only.")
 
 
-def make_context_hook(*, threshold: int, summarizer, memory, log, keep_last: int = 6):
+def make_context_hook(*, threshold: int, summarizer, memory, log, keep_last: int = 6,
+                       thread_id=None):
     def _summarize(head) -> str:
         try:
             resp = summarizer.invoke([SystemMessage(_SUMMARY_INSTRUCTION), *head])
@@ -54,9 +63,11 @@ def make_context_hook(*, threshold: int, summarizer, memory, log, keep_last: int
             return {}
         prior = state.get("running_summary") or ""
         rolling = (prior + "\n" + res.summary).strip()
-        # best-effort: park the dropped detail in durable memory
+        # best-effort: park the dropped detail in durable memory. thread_id lives
+        # in config.configurable, not HarnessState, so state.get("thread_id") is
+        # always None — take it from the assemble-time closure instead.
         memory.record("compacted context: " + res.summary, kind="context",
-                      thread_id=state.get("thread_id"))
+                      thread_id=thread_id)
         log.add("compaction", dropped=len(res.dropped),
                 kept=len(res.kept), summary_chars=len(res.summary))
         # Persisted mutation: drop everything, re-seed with a summary system

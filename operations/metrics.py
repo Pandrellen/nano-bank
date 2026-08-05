@@ -21,6 +21,9 @@ def float_summary(payload: dict) -> dict:
     return {
         "total_float": _dec(payload.get("total_float")),
         "by_system": by_system,
+        # Carry the bank's caveat through to the agent: total_float is a gross
+        # magnitude of signed system balances, not a net position.
+        "basis": payload.get("basis"),
     }
 
 
@@ -79,6 +82,13 @@ def cards_summary(payload: dict) -> dict:
         cap_amount += _dec(g["total"])
     return {
         "window": payload.get("window"),
-        "open_holds": {"count": int(holds.get("open_count", 0)), "amount": _dec(holds.get("open_amount"))},
+        # open_holds is a point-in-time snapshot (not scoped to window); pass the
+        # bank's as_of/basis through so the agent can state that caveat.
+        "open_holds": {
+            "count": int(holds.get("open_count", 0)),
+            "amount": _dec(holds.get("open_amount")),
+            "as_of": holds.get("as_of"),
+            "basis": holds.get("basis"),
+        },
         "captured": {"count": cap_count, "amount": cap_amount},
     }

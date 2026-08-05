@@ -4,7 +4,6 @@ parent. This is both the parallel-work mechanism and a context-control mechanism
 (the child's tool chatter never enters the parent's context). A depth guard stops
 runaway nesting. Agent-agnostic: `build_agent(tool_subset, depth)` is injected."""
 from __future__ import annotations
-import asyncio
 import uuid
 from typing import Annotated
 
@@ -22,8 +21,8 @@ def _last_text(state) -> str:
 
 def make_spawn_tool(*, build_agent, tools_by_name: dict, log, max_depth: int):
     @tool
-    def spawn_subagent(task: str, tools: list[str],
-                       state: Annotated[dict, InjectedState]) -> str:
+    async def spawn_subagent(task: str, tools: list[str],
+                             state: Annotated[dict, InjectedState]) -> str:
         """Delegate a focused deep-dive to a subagent with its own context and a
         subset of your tools (by name). Returns only the subagent's summary. Use
         it to keep the main thread focused (e.g. one rail at a time)."""
@@ -37,7 +36,10 @@ def make_spawn_tool(*, build_agent, tools_by_name: dict, log, max_depth: int):
         cfg = {"configurable": {"thread_id": thread}, "recursion_limit": 30}
         init = {"messages": [HumanMessage(task)], "plan": [], "todos": [],
                 "running_summary": "", "depth": depth + 1}
-        out = asyncio.run(agent.ainvoke(init, config=cfg))
+        # await, not asyncio.run: the parent agent runs inside a live event loop
+        # (the FastAPI /ask path is async), and asyncio.run() would raise
+        # "cannot be called from a running event loop".
+        out = await agent.ainvoke(init, config=cfg)
         summary = _last_text(out)
         log.add("subagent", task=task[:200], tools=list(tools),
                 depth=depth + 1, thread=thread, chars=len(summary))

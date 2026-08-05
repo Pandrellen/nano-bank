@@ -1,6 +1,6 @@
 import uuid
 from langchain_core.messages import HumanMessage
-from coo.harness import assemble, last_tool_names
+from coo.harness import assemble
 from coo.harness.memory import SafeMemory
 from coo.tests.fakes import FakeChatModel, fake_ops_tools
 
@@ -23,7 +23,7 @@ def test_assembled_agent_runs_plan_then_tool_then_answers():
 
 
 def test_memory_tools_present_and_safe_without_qdrant():
-    assemble(FakeChatModel([{"text": "ok"}]), [], "p", SafeMemory(None))
-    names = set(last_tool_names())
+    agent, _ = assemble(FakeChatModel([{"text": "ok"}]), [], "p", SafeMemory(None))
+    names = set(agent.harness_tool_names)
     assert {"write_plan", "write_todos", "recall_memory", "record_memory",
             "spawn_subagent"} <= names

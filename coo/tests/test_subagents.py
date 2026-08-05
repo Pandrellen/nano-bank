@@ -1,3 +1,4 @@
+import asyncio
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import InMemorySaver
 from coo.harness.state import HarnessState
@@ -17,8 +18,8 @@ def test_spawn_runs_child_and_returns_summary():
     tools = {t.name: t for t in fake_ops_tools()}
     spawn = make_spawn_tool(build_agent=_build_agent, tools_by_name=tools,
                             log=log, max_depth=2)
-    out = spawn.invoke({"task": "deep dive interac", "tools": list(tools),
-                        "state": {"depth": 0}})
+    out = asyncio.run(spawn.ainvoke({"task": "deep dive interac", "tools": list(tools),
+                                     "state": {"depth": 0}}))
     assert "deep dive done" in out
     assert any(e["kind"] == "subagent" for e in log.events())
 
@@ -27,6 +28,6 @@ def test_depth_guard_refuses_at_max():
     log = HarnessLog()
     spawn = make_spawn_tool(build_agent=_build_agent, tools_by_name={},
                             log=log, max_depth=2)
-    out = spawn.invoke({"task": "x", "tools": [], "state": {"depth": 2}})
+    out = asyncio.run(spawn.ainvoke({"task": "x", "tools": [], "state": {"depth": 2}}))
     assert "depth" in out.lower()
     assert not any(e["kind"] == "subagent" for e in log.events())

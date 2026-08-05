@@ -10,6 +10,12 @@ from decimal import Decimal, InvalidOperation
 
 from . import claims as _claims
 
+# Memory tools replay prose the COO wrote on *past* turns; a number recalled from
+# an earlier answer is not a fresh tool computation and must not ground a figure
+# stated this turn (otherwise the COO can "remember" a stale total and the
+# verifier waves it through). Grounding harvests only this turn's domain tools.
+_MEMORY_TOOLS = {"recall_memory", "record_memory"}
+
 # A signed number literal: comma-grouped (1,448.08) or plain (9100.00 / 510000),
 # with an optional decimal part. Unicode minus is normalised before matching.
 _NUM = re.compile(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?|-?\d+(?:\.\d+)?")
@@ -27,6 +33,8 @@ def grounded_values(trace: list[dict]) -> list[Decimal]:
     out: list[Decimal] = []
     for ev in trace:
         if ev.get("kind") != "tool":
+            continue
+        if ev.get("name") in _MEMORY_TOOLS:
             continue
         raw = ev.get("output")
         if not raw:

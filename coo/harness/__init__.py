@@ -17,12 +17,6 @@ from .todos import todo_tools
 from .context import make_context_hook
 from .subagents import make_spawn_tool
 
-_LAST_TOOL_NAMES: list[str] = []
-
-
-def last_tool_names() -> list[str]:
-    return list(_LAST_TOOL_NAMES)
-
 
 def memory_tools(memory, log, *, thread_id: Optional[str] = None) -> list:
     @tool
@@ -62,12 +56,14 @@ def assemble(model, domain_tools, prompt, memory, *, log=None, checkpointer=None
         tools = tools + [make_spawn_tool(build_agent=build_agent,
                                          tools_by_name=tools_by_name, log=log,
                                          max_depth=subagent_max_depth)]
-    global _LAST_TOOL_NAMES
-    _LAST_TOOL_NAMES = [t.name for t in tools]
 
     hook = make_context_hook(threshold=context_token_threshold, summarizer=model,
-                             memory=memory, log=log)
+                             memory=memory, log=log, thread_id=thread_id)
     agent = create_react_agent(model, tools, prompt=prompt,
                                state_schema=HarnessState, pre_model_hook=hook,
                                checkpointer=checkpointer or InMemorySaver())
+    # Expose the assembled tool set on the agent instance (not a module global —
+    # concurrent /ask calls and subagent spawns each build their own agent and
+    # would race a shared list).
+    agent.harness_tool_names = [t.name for t in tools]
     return agent, log

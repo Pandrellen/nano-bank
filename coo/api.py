@@ -45,6 +45,14 @@ def create_app(settings: Settings, ask_fn: Optional[Callable] = None,
     probes = probes if probes is not None else _default_probes(settings)
     app = FastAPI(title="nano-bank COO")
 
+    @app.get("/livez")
+    def livez():
+        # Liveness only: is the process up and serving? No dependency probes, no
+        # model inference — a kubelet livenessProbe hitting /health would invoke a
+        # real GLM round-trip (the ollama probe) every few seconds and could kill
+        # a healthy pod on a slow model. Readiness/health lives at /health.
+        return {"status": "ok", "service": "coo"}
+
     @app.get("/health")
     def health():
         checks = {}

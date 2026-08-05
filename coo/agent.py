@@ -6,6 +6,7 @@ import uuid
 from typing import Optional
 
 from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.checkpoint.memory import InMemorySaver
 
 from .config import Settings
 from . import model_factory as mf
@@ -14,6 +15,12 @@ from .trace import TraceRecorder, merge
 from . import verifier, claims
 from .harness import assemble
 from .harness.memory import HarnessMemory, SafeMemory
+
+# One process-lived checkpointer shared across requests so a thread_id restores
+# its plan/todos/running_summary on the next /ask. assemble() otherwise defaults
+# to a fresh InMemorySaver per call, which would discard all harness state every
+# turn (a multi-turn review would forget its own plan between questions).
+_CHECKPOINTER = InMemorySaver()
 
 COO_PROMPT = (
     "You are the Chief Operating Officer of nano-bank, a Canadian challenger "
@@ -54,7 +61,7 @@ async def ask(settings: Settings, message: str, thread_id: Optional[str] = None,
     tools = await get_tools(settings)
     rec = TraceRecorder()
     agent, log = assemble(mf.llm(), tools, COO_PROMPT, memory,
-                          thread_id=thread_id,
+                          thread_id=thread_id, checkpointer=_CHECKPOINTER,
                           context_token_threshold=settings.context_token_threshold,
                           subagent_max_depth=settings.subagent_max_depth)
     cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60,

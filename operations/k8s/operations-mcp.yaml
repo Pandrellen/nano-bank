@@ -17,7 +17,12 @@ spec:
         ports: [ { containerPort: 8092 } ]
         env:
         - { name: NANO_BANK_API,        value: http://bank-api:8081 }
-        - { name: SERVICE_CLIENT_SECRET, value: "nano-bank-visa-network-secret-change-me" }
+        # Shared service-plane credential with the bank — sourced from a Secret,
+        # never a plaintext manifest value. Minted by coo/k8s/deploy.sh into
+        # nano-agent-secrets (must equal bank-api's service_client_secret).
+        - name: SERVICE_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef: { name: nano-agent-secrets, key: SERVICE_CLIENT_SECRET }
         - { name: MCP_PORT,             value: "8092" }
 ---
 apiVersion: v1

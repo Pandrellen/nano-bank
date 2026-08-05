@@ -16,6 +16,20 @@ use crate::errors::AppError;
 use crate::handlers::AppState;
 use crate::middleware::auth::AuthenticatedService;
 
+/// The bank's synthetic system customers that own the clearing/settlement
+/// float. Keyed by **exact email**, never a `@nano.bank` suffix match:
+/// `POST /customers` accepts any address that passes email validation, so a real
+/// customer could register `anything@nano.bank` and a `LIKE '%@nano.bank'` filter
+/// would fold their balance into the bank's float. These are the same fixed
+/// identities the rail/cards/finance handlers key off by constant.
+const SYSTEM_CUSTOMER_EMAILS: [&str; 5] = [
+    "system@nano.bank",
+    "interac@nano.bank",
+    "aft@nano.bank",
+    "lynx@nano.bank",
+    "cash@nano.bank",
+];
+
 pub fn back_office_routes() -> Router<AppState> {
     Router::new()
         .route("/ops/float", get(ops_float))
@@ -37,7 +51,18 @@ struct FloatAccount {
 struct FloatResponse {
     accounts: Vec<FloatAccount>,
     total_float: Decimal,
+    /// What `total_float` is and is not. It is a **gross sum** of the system
+    /// accounts' balances. Its components are signed per GL convention (clearing
+    /// carries the issuer's obligation as a negative; `external_cash` represents
+    /// cash *outside* the bank) and are **not economically additive** — read it
+    /// as a magnitude, not a net position. Surfaced in the payload so the figure
+    /// never travels to the agent without its basis.
+    basis: String,
 }
+
+const FLOAT_BASIS: &str = "gross sum of system-account balances; components are \
+    signed per GL convention (clearing negative, external_cash exogenous) and are \
+    not economically additive — a magnitude, not a net position";
 
 #[derive(sqlx::FromRow)]
 struct FloatRow {
@@ -53,13 +78,15 @@ async fn ops_float(
     _: AuthenticatedService,
     State(state): State<AppState>,
 ) -> Result<Json<FloatResponse>, AppError> {
+    let system_emails: Vec<String> = SYSTEM_CUSTOMER_EMAILS.iter().map(|s| s.to_string()).collect();
     let rows = sqlx::query_as::<_, FloatRow>(
         "SELECT c.email AS email, a.account_type::text AS account_type, a.balance AS balance
          FROM accounts a
          JOIN customers c ON c.customer_id = a.customer_id
-         WHERE c.email LIKE '%@nano.bank'
+         WHERE c.email = ANY($1)
          ORDER BY c.email, a.account_type",
     )
+    .bind(&system_emails)
     .fetch_all(&state.pool)
     .await
     .map_err(AppError::Database)?;
@@ -86,6 +113,7 @@ async fn ops_float(
     Ok(Json(FloatResponse {
         accounts,
         total_float: total,
+        basis: FLOAT_BASIS.to_string(),
     }))
 }
 
@@ -298,11 +326,26 @@ async fn ops_exceptions(
     }))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
-struct HoldsSummary {
+#[derive(sqlx::FromRow)]
+struct HoldsRow {
     open_count: i64,
     open_amount: Decimal,
 }
+
+/// Authorization holds open **right now**. Point-in-time, NOT windowed: the
+/// enclosing response's `window`/`since` do not apply to this field, so the
+/// marker travels in the JSON rather than living only in a doc comment the
+/// serializer drops. `as_of` is the instant it was read.
+#[derive(Serialize)]
+struct AuthorizationHolds {
+    open_count: i64,
+    open_amount: Decimal,
+    as_of: DateTime<Utc>,
+    basis: String,
+}
+
+const HOLDS_BASIS: &str = "point-in-time snapshot of holds open now (released_at \
+    IS NULL); not scoped to the response window";
 
 #[derive(Serialize, sqlx::FromRow)]
 struct CardTxnGroup {
@@ -316,8 +359,9 @@ struct CardTxnGroup {
 struct CardsResponse {
     window: String,
     since: DateTime<Utc>,
-    /// Point-in-time (not windowed): authorization holds currently open.
-    authorization_holds: HoldsSummary,
+    /// Point-in-time (not windowed): authorization holds currently open. The
+    /// `as_of`/`basis` fields carry that caveat in the payload itself.
+    authorization_holds: AuthorizationHolds,
     /// Card-tagged transactions (`product = 'card'`) over the window.
     card_transactions: Vec<CardTxnGroup>,
 }
@@ -335,7 +379,7 @@ async fn ops_cards(
     let window = q.window.unwrap_or_else(|| "24h".to_string());
     let since = window_cutoff(&window)?;
 
-    let authorization_holds = sqlx::query_as::<_, HoldsSummary>(
+    let holds = sqlx::query_as::<_, HoldsRow>(
         "SELECT COUNT(*) AS open_count, COALESCE(SUM(amount), 0) AS open_amount
          FROM account_holds
          WHERE released_at IS NULL",
@@ -343,6 +387,12 @@ async fn ops_cards(
     .fetch_one(&state.pool)
     .await
     .map_err(AppError::Database)?;
+    let authorization_holds = AuthorizationHolds {
+        open_count: holds.open_count,
+        open_amount: holds.open_amount,
+        as_of: Utc::now(),
+        basis: HOLDS_BASIS.to_string(),
+    };
 
     let card_transactions = sqlx::query_as::<_, CardTxnGroup>(
         "SELECT transaction_type,

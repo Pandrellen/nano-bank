@@ -10,11 +10,13 @@ def test_float_summary_totals_by_system():
             {"system": "lynx", "role": "clearing", "account_type": "chequing", "balance": "25.50"},
         ],
         "total_float": "175.50",
+        "basis": "gross sum; not a net position",
     }
     out = metrics.float_summary(payload)
     assert out["total_float"] == D("175.50")
     assert out["by_system"]["interac"] == D("150.00")
     assert out["by_system"]["lynx"] == D("25.50")
+    assert out["basis"] == "gross sum; not a net position"
 
 
 def test_transactions_summary_rolls_up_by_type():
@@ -74,7 +76,9 @@ def test_cards_summary_holds_and_captured():
     payload = {
         "window": "30d",
         "since": "2026-07-01T00:00:00Z",
-        "authorization_holds": {"open_count": 4, "open_amount": "220.00"},
+        "authorization_holds": {"open_count": 4, "open_amount": "220.00",
+                                "as_of": "2026-08-05T12:00:00Z",
+                                "basis": "open now; not windowed"},
         "card_transactions": [
             {"transaction_type": "card_purchase", "status": "completed", "count": 3, "total": "150.00"},
             {"transaction_type": "card_settlement", "status": "completed", "count": 2, "total": "100.00"},
@@ -83,5 +87,7 @@ def test_cards_summary_holds_and_captured():
     out = metrics.cards_summary(payload)
     assert out["open_holds"]["count"] == 4
     assert out["open_holds"]["amount"] == D("220.00")
+    assert out["open_holds"]["as_of"] == "2026-08-05T12:00:00Z"
+    assert out["open_holds"]["basis"] == "open now; not windowed"
     assert out["captured"]["count"] == 5
     assert out["captured"]["amount"] == D("250.00")

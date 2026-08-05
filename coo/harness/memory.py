@@ -39,9 +39,17 @@ class HarnessMemory:
     def _vec(self, text: str):
         return list(next(iter(self._embed.embed([text]))))
 
-    def _filter(self):
-        return models.Filter(must=[models.FieldCondition(
-            key="namespace", match=models.MatchValue(value=self.namespace))])
+    def _filter(self, kind: Optional[str] = "observation"):
+        must = [models.FieldCondition(
+            key="namespace", match=models.MatchValue(value=self.namespace))]
+        if kind is not None:
+            # recall surfaces agent observations only. Context-compaction dumps
+            # are written with kind="context" for recoverability, but must never
+            # be replayed as recalled facts (they'd re-ground stale figures in the
+            # verifier and pollute the prompt), so they're filtered out here.
+            must.append(models.FieldCondition(
+                key="kind", match=models.MatchValue(value=kind)))
+        return models.Filter(must=must)
 
     def record(self, fact: str, *, kind: str = "observation",
                thread_id: Optional[str] = None) -> str:
