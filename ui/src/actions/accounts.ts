@@ -30,6 +30,11 @@ export async function createAccountAction(formData: FormData): Promise<CreateAcc
     return { success: false, message: "Please select an account type." };
   }
 
+  // One key per form mount (see CreateAccountForm) so a double-click or a
+  // retry after a dropped response replays the original account instead of
+  // opening a second one.
+  const idempotencyKey = formData.get("idempotencyKey");
+
   const cookieStore = await cookies();
   const accessToken = cookieStore.get("access_token")?.value;
   if (!accessToken) {
@@ -44,7 +49,10 @@ export async function createAccountAction(formData: FormData): Promise<CreateAcc
         "content-type": "application/json",
         Authorization: `Bearer ${accessToken}`,
       },
-      body: JSON.stringify({ account_type: accountType }),
+      body: JSON.stringify({
+        account_type: accountType,
+        idempotency_key: typeof idempotencyKey === "string" ? idempotencyKey : undefined,
+      }),
       cache: "no-store",
     });
   } catch (error) {

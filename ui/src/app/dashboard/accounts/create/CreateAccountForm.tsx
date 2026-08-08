@@ -26,6 +26,10 @@ export default function CreateAccountForm() {
   const router = useRouter();
   const [loading, setLoading] = useState(false);
   const [accountType, setAccountType] = useState<(typeof ACCOUNT_TYPES)[number]["value"]>("chequing");
+  // One key for the lifetime of this form mount: a double-click or a retry
+  // after a dropped response reuses it, so the server collapses the repeat
+  // into the original account instead of opening a second one.
+  const [idempotencyKey] = useState(() => crypto.randomUUID());
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -50,6 +54,7 @@ export default function CreateAccountForm() {
 
   return (
     <form onSubmit={handleSubmit} className="space-y-5 w-full">
+      <input type="hidden" name="idempotencyKey" value={idempotencyKey} />
       <div className="space-y-1.5">
         <span className="text-xs font-semibold tracking-wide text-slate-300">Account Type</span>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
