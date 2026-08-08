@@ -41,29 +41,30 @@ export default function CreateAccountForm() {
       if (response.success) {
         toast.success(response.message);
         router.push(response.accountId ? `/dashboard/accounts/${response.accountId}` : "/dashboard/accounts");
-      } else {
-        toast.error(response.message);
+        // Don't clear `loading` here — we're navigating away, and re-enabling
+        // the button while that's in flight flashes it back to "Open Account".
+        return;
       }
+      toast.error(response.message);
     } catch (error) {
       console.error(error);
       toast.error("An unexpected error occurred while opening your account.");
-    } finally {
-      setLoading(false);
     }
+    setLoading(false);
   };
 
   return (
     <form onSubmit={handleSubmit} className="space-y-5 w-full">
       <input type="hidden" name="idempotencyKey" value={idempotencyKey} />
-      <div className="space-y-1.5">
-        <span className="text-xs font-semibold tracking-wide text-slate-300">Account Type</span>
+      <fieldset className="space-y-1.5 border-0 p-0 m-0">
+        <legend className="text-xs font-semibold tracking-wide text-slate-300 px-0">Account Type</legend>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           {ACCOUNT_TYPES.map(({ value, label, description, icon: Icon }) => {
             const selected = accountType === value;
             return (
               <label
                 key={value}
-                className={`flex items-start gap-3 p-4 rounded-xl border cursor-pointer transition-all ${
+                className={`flex items-start gap-3 p-4 rounded-xl border cursor-pointer transition-all focus-within:ring-2 focus-within:ring-nanobank-blue-sky/60 focus-within:ring-offset-2 focus-within:ring-offset-slate-950 ${
                   selected
                     ? "border-nanobank-blue-sky/60 bg-nanobank-blue-sky/10"
                     : "border-slate-700 bg-slate-900/50 hover:border-slate-500"
@@ -92,7 +93,7 @@ export default function CreateAccountForm() {
             );
           })}
         </div>
-      </div>
+      </fieldset>
 
       <SubmitButton loading={loading} loadingText="Opening Account...">
         Open Account
