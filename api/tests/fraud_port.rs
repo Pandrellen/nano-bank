@@ -723,21 +723,20 @@ async fn fraud_link_404s_for_an_unknown_transaction() {
     assert_eq!(status, 404);
 }
 
-/// **Known gap, pinned:** a screened rail movement is indistinguishable from an
-/// unscreened one through this endpoint (#52).
+/// A screened **rail** movement resolves to the engine's decision (#52).
 ///
-/// Interac, AFT and Lynx create real `transactions` rows via
-/// `rails/common.rs::new_txn`, and their handlers *do* call `screen()`. What
-/// they don't do is stamp `metadata.fraud`, so the linkage is never stored and
-/// the lookup returns nulls — byte-identical to a transaction that was never
-/// screened at all. A consumer reading a null as "no decision existed" will
-/// under-count screened traffic, which is the blindness #46 was filed over.
+/// This test used to pin the opposite. Interac, AFT and Lynx create real
+/// `transactions` rows and call `screen()`, but never stamped
+/// `metadata.fraud` — so their decisions, possibly **blocks**, were unreachable
+/// and `fraud-link` answered nulls indistinguishable from "never screened".
+/// That is what made a null uninterpretable, and it is now fixed for the rails
+/// whose screening and money movement share a request.
 ///
-/// This test asserts today's behaviour rather than the desired one, on purpose:
-/// when #52 stamps the linkage it will fail, forcing whoever fixes it to update
-/// the expectation deliberately instead of discovering the coupling by accident.
+/// Asserted against the engine's own `decisions` row, not merely "is a UUID":
+/// a well-formed id that points at the wrong decision is worse than a null,
+/// because every label downstream attaches silently to the wrong thing.
 #[tokio::test]
-async fn fraud_link_cannot_yet_see_a_screened_rail_movement() {
+async fn fraud_link_resolves_a_screened_rail_movement() {
     let c = client();
     require_stack!(&c);
     require_fraud_e2e!(&c);
@@ -748,9 +747,6 @@ async fn fraud_link_cannot_yet_see_a_screened_rail_movement() {
         return;
     }
 
-    // An Interac send: screened by `interac.rs`, and it writes an `interac_hold`
-    // row through `new_txn`. The rail returns an `etransfer_id`, not a
-    // transaction id — the row it wrote is what this test is about.
     let sent = c
         .post(format!("{}/api/v1/interac/etransfers", base_url()))
         .bearer_auth(&token)
@@ -758,39 +754,41 @@ async fn fraud_link_cannot_yet_see_a_screened_rail_movement() {
             "from_account_id": account,
             "amount": 60.00,
             "recipient_handle_type": "email",
-            "recipient_handle_value": format!("gap-{}@example.com", Uuid::new_v4()),
+            "recipient_handle_value": format!("rail-{}@example.com", Uuid::new_v4()),
             "security_question": "q",
             "security_answer": "a",
-            "idempotency_key": format!("gap-{}", Uuid::new_v4()),
+            "idempotency_key": format!("rail-{}", Uuid::new_v4()),
         }))
         .send()
         .await
         .unwrap();
     assert!(sent.status().is_success(), "interac send: {}", sent.status());
 
+    // The rail hands back an `etransfer_id`; the row that was screened is the
+    // `interac_hold` it wrote through `new_txn`.
     let Some(pool) = test_db().await else { return };
-    let row: Option<(Uuid, Option<Value>)> = sqlx::query_as(
-        "SELECT transaction_id, metadata FROM transactions \
+    let (txn_id,): (Uuid,) = sqlx::query_as(
+        "SELECT transaction_id FROM transactions \
          WHERE transaction_type LIKE 'interac\\_%' ORDER BY created_at DESC LIMIT 1",
     )
-    .fetch_optional(&pool)
+    .fetch_one(&pool)
     .await
     .unwrap();
-    let Some((txn_id, metadata)) = row else {
-        panic!("the Interac send must have written a transactions row");
-    };
-    assert!(
-        metadata.as_ref().and_then(|m| m.get("fraud")).is_none(),
-        "precondition: the rail stores no fraud linkage yet — if this fails, \
-         #52 has landed and this test should now assert the ids are present"
-    );
 
     let svc = service_token(&c).await;
     let link = fraud_link(&c, &svc, txn_id).await;
     assert_eq!(link.status().as_u16(), 200);
     let link: Value = link.json().await.unwrap();
-    assert!(
-        link["operation_id"].is_null(),
-        "pinning today's gap: a screened rail movement reads as unscreened {link}"
-    );
+    let op_id = link["operation_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a screened rail movement must resolve: {link}"));
+
+    // It has to be the decision the ENGINE recorded, not just a well-formed id.
+    let Some(engine) = engine_db().await else { return };
+    let seen: i64 = sqlx::query_scalar("SELECT count(*) FROM decisions WHERE operation_id = $1")
+        .bind(Uuid::parse_str(op_id).unwrap())
+        .fetch_one(&engine)
+        .await
+        .unwrap();
+    assert_eq!(seen, 1, "operation_id {op_id} must name a real engine decision");
 }
