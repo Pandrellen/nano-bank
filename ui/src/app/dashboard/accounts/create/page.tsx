@@ -3,6 +3,7 @@ import { Metadata } from 'next';
 import BackLink from "@/components/BackLink";
 import GlassCard from "@/components/GlassCard";
 import GradientHeading from "@/components/GradientHeading";
+import CreateAccountForm from "./CreateAccountForm";
 
 export const metadata: Metadata = {
   title: 'Nano-Bank - Open New Account',
@@ -22,9 +23,7 @@ export default async function CreateAccountPage() {
                         <GradientHeading>Open a New Account</GradientHeading>
                     </div>
 
-                    <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 p-8 text-center text-sm text-slate-400">
-                        Account creation form will come here.
-                    </div>
+                    <CreateAccountForm />
                 </GlassCard>
             </div>
         </main>
