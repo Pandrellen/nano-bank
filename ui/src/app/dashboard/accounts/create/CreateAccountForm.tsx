@@ -36,7 +36,7 @@ export default function CreateAccountForm() {
       const response = await createAccountAction(formData);
       if (response.success) {
         toast.success(response.message);
-        router.push("/dashboard/accounts");
+        router.push(response.accountId ? `/dashboard/accounts/${response.accountId}` : "/dashboard/accounts");
       } else {
         toast.error(response.message);
       }
