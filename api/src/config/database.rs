@@ -154,6 +154,13 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
         // Additive; entries written before this stay NULL, which reads correctly
         // as "no linkage recorded".
         "ALTER TABLE aft_entries ADD COLUMN IF NOT EXISTS metadata JSONB",
+        // Carries the fraud linkage across the authorize → capture boundary for
+        // cards (#54): screening happens in one request and the transactions row
+        // is written in another, so without somewhere to rest the engine's
+        // operation_id in between, the decision becomes unreachable. Additive;
+        // holds written before this stay NULL, which reads correctly as "no
+        // linkage recorded".
+        "ALTER TABLE account_holds ADD COLUMN IF NOT EXISTS metadata JSONB",
         // Phase 3: step-up pending approvals.
         r#"
         CREATE TABLE IF NOT EXISTS pending_approvals (
