@@ -306,6 +306,14 @@ pub async fn run_migrations(pool: &DatabasePool) -> Result<(), sqlx::Error> {
         "ALTER TABLE agents ADD COLUMN IF NOT EXISTS registered_ip INET",
         "CREATE INDEX IF NOT EXISTS idx_agents_registered_ip \
          ON agents (registered_ip, created_at) WHERE registered_ip IS NOT NULL",
+        // Idempotent "open account": a retried request (same customer, same key)
+        // must return the original account, not open a second one. Additive
+        // self-heal for DBs whose accounts table predates the key — the column
+        // is nullable so existing rows and unkeyed callers stay NULL, and NULLs
+        // are distinct in the partial index so they never collide.
+        "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(255)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_idempotency \
+         ON accounts (customer_id, idempotency_key) WHERE idempotency_key IS NOT NULL",
     ] {
         sqlx::query(ddl).execute(pool).await?;
     }
