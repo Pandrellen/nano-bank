@@ -21,6 +21,7 @@ use crate::errors::AppError;
 use crate::handlers::cards::{
     fetch_account_for_update, normalize_amount, post_gl_entry, reference_number,
 };
+use crate::handlers::declines::{record_decline, DeclineEvent, DeclineReason};
 use crate::handlers::AppState;
 use crate::ledger::Account as GlAccount;
 use crate::middleware::auth::{AuthenticatedCustomer, AuthenticatedService};
@@ -407,6 +408,19 @@ async fn create_credit(
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
     if amount > max_cpa_amount() {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "aft_credit",
+                reason: DeclineReason::AmountExceedsMax,
+                account_id: Some(req.originator_account_id),
+                customer_id: Some(caller.customer_id),
+                amount: Some(amount),
+                counterparty: None,
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::BadRequest(
             "amount exceeds AFT file field limit".into(),
         ));
@@ -483,6 +497,19 @@ async fn create_debit(
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
     if amount > max_cpa_amount() {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "aft_debit",
+                reason: DeclineReason::AmountExceedsMax,
+                account_id: Some(req.originator_account_id),
+                customer_id: Some(caller.customer_id),
+                amount: Some(amount),
+                counterparty: None,
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::BadRequest(
             "amount exceeds AFT file field limit".into(),
         ));
@@ -610,6 +637,15 @@ async fn submit_batch(
     _svc: AuthenticatedService,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<BatchResponse>, AppError> {
+    Ok(Json(submit_batch_inner(&state, batch_id).await?))
+}
+
+/// The batch cut itself (status check, CPA-005 emit, mark submitted), callable by
+/// the admin route above and the COO's `cut-aft-batch` lever (`ops_levers.rs`).
+pub(crate) async fn submit_batch_inner(
+    state: &AppState,
+    batch_id: Uuid,
+) -> Result<BatchResponse, AppError> {
     let mut tx = state.pool.begin().await?;
     let status: String =
         sqlx::query_scalar("SELECT status::text FROM aft_batches WHERE batch_id=$1 FOR UPDATE")
@@ -695,7 +731,7 @@ async fn submit_batch(
         .map_err(|e| AppError::Internal(format!("write CPA-005 file: {e}")))?;
 
     tracing::info!(%batch_id, entries = entry_count, file = %path, "📄 AFT batch submitted");
-    Ok(Json(load_batch(&state, batch_id).await?))
+    load_batch(state, batch_id).await
 }
 async fn list_entries(
     State(state): State<AppState>,

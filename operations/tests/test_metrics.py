@@ -72,10 +72,27 @@ def test_exceptions_summary_sums_counts():
     assert out["by_kind"]["rejected_aft_entries"] == 3
 
 
+def test_compute_derived_figures():
+    # the average-card-purchase case that used to make the COO refuse
+    assert metrics.compute("ratio", [9802.52, 34])["result"] == D("288.3094")
+    assert metrics.compute("mean", [10, 20, 30])["result"] == D("20.00")
+    assert metrics.compute("sum", ["100.00", "50.00"])["result"] == D("150.00")
+    assert metrics.compute("percent", [1122981.14, 1179606.42])["result"] == D("95.20")
+    assert metrics.compute("difference", [100, 40])["result"] == D("60.00")
+    assert metrics.compute("product", [3, 4])["result"] == D("12.00")
+
+
+def test_compute_guards_bad_input():
+    assert "error" in metrics.compute("ratio", [5])            # missing denominator
+    assert "error" in metrics.compute("percent", [5, 0])       # zero denominator
+    assert "error" in metrics.compute("bogus", [1, 2])         # unknown op
+
+
 def test_cards_summary_holds_and_captured():
     payload = {
         "window": "30d",
         "since": "2026-07-01T00:00:00Z",
+        "cardholders": {"active": 8, "single_purchase": 3},
         "authorization_holds": {"open_count": 4, "open_amount": "220.00",
                                 "as_of": "2026-08-05T12:00:00Z",
                                 "basis": "open now; not windowed"},
@@ -91,3 +108,33 @@ def test_cards_summary_holds_and_captured():
     assert out["open_holds"]["basis"] == "open now; not windowed"
     assert out["captured"]["count"] == 5
     assert out["captured"]["amount"] == D("250.00")
+    assert out["cardholders"] == {"active": 8, "single_purchase": 3}
+
+
+def test_declines_summary_rolls_up_categories_and_channels():
+    raw = {
+        "window": "30d", "total_count": 3, "total_amount": "1500.00",
+        "by_category": {"nsf": {"count": 2, "amount": "1000.00"},
+                        "other": {"count": 1, "amount": "500.00"}},
+        "by_channel": {"card_authorize": {"count": 3, "amount": "1500.00"}},
+    }
+    out = metrics.declines_summary(raw)
+    assert out["total_count"] == 3
+    assert out["by_category"]["nsf"]["count"] == 2
+    assert out["by_channel"]["card_authorize"]["count"] == 3
+    # the fraud bucket must never appear
+    assert "risk" not in out["by_category"]
+
+
+def test_declines_summary_drops_a_risk_bucket_defensively():
+    raw = {"by_category": {"risk": {"count": 5, "amount": "9.00"}}, "by_channel": {}}
+    out = metrics.declines_summary(raw)
+    assert "risk" not in out["by_category"]
+
+
+def test_cards_summary_threads_rates_through():
+    payload = {"window": "30d", "authorization_holds": {}, "card_transactions": [],
+               "cardholders": {}, "rates": {"approved": 4, "declined": 1,
+               "decline_rate": 0.2}}
+    out = metrics.cards_summary(payload)
+    assert out["rates"]["decline_rate"] == 0.2

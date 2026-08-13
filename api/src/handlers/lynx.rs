@@ -19,6 +19,7 @@ use validator::Validate;
 
 use crate::errors::AppError;
 use crate::handlers::cards::{fetch_account_for_update, normalize_amount};
+use crate::handlers::declines::{record_decline, DeclineEvent, DeclineReason};
 use crate::handlers::AppState;
 use crate::lynx::iso20022::{self, Camt029, Camt056, CreditTransfer};
 use crate::middleware::auth::{AuthenticatedCustomer, AuthenticatedService};
@@ -58,7 +59,7 @@ fn min_amount(state: &AppState) -> Decimal {
 }
 
 /// How old (minutes) a `sent` wire must be before the admin sweep rejects it.
-fn stale_minutes(state: &AppState) -> i32 {
+pub(crate) fn stale_minutes(state: &AppState) -> i32 {
     state.settings.lynx.stale_minutes
 }
 
@@ -185,6 +186,19 @@ async fn initiate_wire(
     let amount = normalize_amount(req.amount)?;
     let floor = min_amount(&state);
     if amount < floor {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "lynx_wire",
+                reason: DeclineReason::BelowFloor,
+                account_id: Some(req.from_account_id),
+                customer_id: Some(caller.customer_id),
+                amount: Some(amount),
+                counterparty: None,
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::BadRequest(format!(
             "amount below the high-value floor of {floor}"
         )));
@@ -260,6 +274,19 @@ async fn initiate_wire(
         return Err(AppError::BadRequest("account is not active".into()));
     }
     if account.available_balance < amount {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "lynx_wire",
+                reason: DeclineReason::InsufficientFunds,
+                account_id: Some(account.account_id),
+                customer_id: Some(account.customer_id),
+                amount: Some(amount),
+                counterparty: None,
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::InsufficientFunds);
     }
 
@@ -826,7 +853,15 @@ async fn admin_reject_stale(
     State(state): State<AppState>,
     _svc: AuthenticatedService,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let rail = resolve_lynx(&state).await?;
+    Ok(Json(admin_reject_stale_inner(&state).await?))
+}
+
+/// The stale-wire reject itself, callable by the admin route above and the COO's
+/// `reject-stale-wires` lever (`ops_levers.rs`).
+pub(crate) async fn admin_reject_stale_inner(
+    state: &AppState,
+) -> Result<serde_json::Value, AppError> {
+    let rail = resolve_lynx(state).await?;
     // Snapshot the due ids first (short read), then process each in its own tx so
     // one bad row can't roll back the batch and we don't hold a lock on every
     // stale wire at once (mirrors interac::sweep_expired).
@@ -860,7 +895,7 @@ async fn admin_reject_stale(
             transaction_id: Uuid::nil(),
         };
         zero_available(&mut tx, local_account_id).await?;
-        rail.refund(&state, &mut tx, &hold, "Lynx stale wire rejected")
+        rail.refund(state, &mut tx, &hold, "Lynx stale wire rejected")
             .await?;
         recompute_available(&mut tx, local_account_id).await?;
         sqlx::query("UPDATE lynx_wires SET status='rejected' WHERE wire_id=$1")
@@ -871,5 +906,5 @@ async fn admin_reject_stale(
         rejected += 1;
     }
 
-    Ok(Json(serde_json::json!({ "rejected": rejected })))
+    Ok(serde_json::json!({ "rejected": rejected }))
 }

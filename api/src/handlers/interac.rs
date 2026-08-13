@@ -18,6 +18,7 @@ use validator::Validate;
 
 use crate::errors::AppError;
 use crate::handlers::cards::{fetch_account_for_update, normalize_amount};
+use crate::handlers::declines::{record_decline, DeclineEvent, DeclineReason};
 use crate::handlers::AppState;
 use crate::middleware::auth::{AuthenticatedCustomer, AuthenticatedService};
 use crate::models::interac::{
@@ -78,6 +79,19 @@ async fn send_etransfer(
     req.validate()?;
     let amount = normalize_amount(req.amount)?;
     if amount > max_amount(&state) {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "interac_etransfer",
+                reason: DeclineReason::AmountExceedsMax,
+                account_id: Some(req.from_account_id),
+                customer_id: Some(caller.customer_id),
+                amount: Some(amount),
+                counterparty: Some(req.recipient_handle_value.clone()),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::BadRequest(format!(
             "amount exceeds per-transfer max {}",
             max_amount(&state)
@@ -152,6 +166,19 @@ async fn send_etransfer(
         return Err(AppError::NotFound("account not found".into())); // 404, not 403
     }
     if amount > sender.available_balance {
+        record_decline(
+            &state.pool,
+            DeclineEvent {
+                channel: "interac_etransfer",
+                reason: DeclineReason::InsufficientFunds,
+                account_id: Some(sender.account_id),
+                customer_id: Some(sender.customer_id),
+                amount: Some(amount),
+                counterparty: Some(recipient_handle.clone()),
+                metadata: serde_json::json!({}),
+            },
+        )
+        .await;
         return Err(AppError::InsufficientFunds);
     }
 
@@ -330,7 +357,7 @@ async fn notify(
 
 /// Attempts before a notification is dead-lettered: left undelivered with its
 /// `last_delivery_error`, and no longer picked up by the drainer.
-const MAX_DELIVERY_ATTEMPTS: i32 = 5;
+pub(crate) const MAX_DELIVERY_ATTEMPTS: i32 = 5;
 /// Rows claimed per flush — bounds one admin call's work.
 const FLUSH_BATCH: i64 = 100;
 
@@ -376,6 +403,14 @@ async fn flush_notifications(
     State(state): State<AppState>,
     _svc: AuthenticatedService,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    Ok(Json(flush_notifications_inner(&state).await?))
+}
+
+/// The drain itself, callable by the admin route above and by the COO's
+/// `flush-notifications` lever (`ops_levers.rs`).
+pub(crate) async fn flush_notifications_inner(
+    state: &AppState,
+) -> Result<serde_json::Value, AppError> {
     let claimed = sqlx::query_as::<_, ClaimedNotification>(
         &OutboxClaim {
             table: "interac_notifications",
@@ -423,11 +458,11 @@ async fn flush_notifications(
         }
     }
 
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "claimed": claimed_count,
         "delivered": delivered,
         "failed": failed,
-    })))
+    }))
 }
 
 fn idempotency_conflict(e: sqlx::Error) -> AppError {
@@ -1131,7 +1166,13 @@ async fn sweep_expired(
     State(state): State<AppState>,
     _svc: AuthenticatedService,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let rail = resolve_interac(&state).await?;
+    Ok(Json(sweep_expired_inner(&state).await?))
+}
+
+/// The sweep itself, callable by the admin route above and the COO's
+/// `sweep-expired-etransfers` lever (`ops_levers.rs`).
+pub(crate) async fn sweep_expired_inner(state: &AppState) -> Result<serde_json::Value, AppError> {
+    let rail = resolve_interac(state).await?;
     // Snapshot the due ids first (short read), then process each in its own tx so
     // one bad row can't roll back the batch.
     let due: Vec<Uuid> = sqlx::query_scalar(
@@ -1163,7 +1204,7 @@ async fn sweep_expired(
             reference: hold_ref,
             transaction_id: Uuid::nil(),
         };
-        rail.refund(&state, &mut tx, &hold, "Interac e-Transfer expired")
+        rail.refund(state, &mut tx, &hold, "Interac e-Transfer expired")
             .await?;
         // Only recompute for a real CUSTOMER account; skip for the rail's own
         // SETTLEMENT/CLEARING accounts (inbound held transfers), whose
@@ -1193,5 +1234,5 @@ async fn sweep_expired(
         tx.commit().await?;
         expired += 1;
     }
-    Ok(Json(serde_json::json!({ "expired": expired })))
+    Ok(serde_json::json!({ "expired": expired }))
 }

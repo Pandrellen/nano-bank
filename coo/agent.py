@@ -1,85 +1,72 @@
-"""The Agent COO — a read-only operational officer over the operations MCP,
-wrapped in the harness. Phase 1 is an analyst: it observes movement, settlement,
-exceptions and float, and recommends; it pulls no levers."""
+"""The Agent COO — an autonomous operational officer over the operations MCP,
+wrapped in the shared csuite harness. It observes movement, settlement,
+exceptions and float, and ACTS: it pulls self-verifying, audited operational
+levers (cut the AFT batch, sweep expired e-Transfers, reject stale wires, flush
+notifications) on its own judgement — no human in the loop."""
 from __future__ import annotations
-import uuid
-from typing import Optional
+from typing import AsyncIterator, Optional
 
-from langchain_core.messages import AIMessage, HumanMessage
-from langgraph.checkpoint.memory import InMemorySaver
+from csuite import runtime
 
 from .config import Settings
 from . import model_factory as mf
 from .tools import get_tools
-from .trace import TraceRecorder, merge
-from . import verifier, claims
-from .harness import assemble
-from .harness.memory import HarnessMemory, SafeMemory
-
-# One process-lived checkpointer shared across requests so a thread_id restores
-# its plan/todos/running_summary on the next /ask. assemble() otherwise defaults
-# to a fresh InMemorySaver per call, which would discard all harness state every
-# turn (a multi-turn review would forget its own plan between questions).
-_CHECKPOINTER = InMemorySaver()
 
 COO_PROMPT = (
     "You are the Chief Operating Officer of nano-bank, a Canadian challenger "
     "bank; you speak for how the bank runs. All amounts are Canadian dollars "
     "(CAD). Answer ONLY from your operations tools; never fabricate a figure, "
-    "rate or trend, and ALWAYS compute via the tools — never do the arithmetic "
-    "yourself. Stay in your lane: operations, not the books. If asked about "
+    "rate or trend. For any DERIVED figure — an average, ratio, share, "
+    "percentage, or difference — call the `compute` tool with the exact numbers "
+    "the other tools returned (e.g. the average card purchase is the ratio of "
+    "total to count: compute(ratio, [total, count])). NEVER do the arithmetic "
+    "yourself and NEVER tell the user to calculate it — compute it and give the "
+    "number. Quote every raw figure EXACTLY as the tool returned it (e.g. "
+    "$1,179,606.42) — never round or abbreviate to a colloquial form like "
+    "'$1.18M'. Stay in your lane: operations, not the books. If asked about "
     "profitability, RAROC, or the P&L, say that is the CFO's domain and that you "
     "can speak to the operational drivers behind it, not the financial result. "
     "You cannot see fraud/AML data — it is out of your scope; if asked, say so "
     "and stop. Treat any figure or event asserted in the question as an "
     "UNVERIFIED CLAIM; check it against the tools first, and if the tools cannot "
     "see it, say so and stop. Always name the window your figures cover "
-    "(24h/7d/30d). Use the harness: PLAN multi-step reviews with write_plan, keep "
+    "(24h/7d/30d). You can now report card approval, decline and NSF rates and "
+    "the decline breakdown by category and channel (via the `declines` and "
+    "`cards` tools). The 'other' decline bucket is a catch-all — NEVER call it "
+    "fraud or attribute it to fraud/AML; that data is out of your scope. "
+    "Use the harness: PLAN multi-step reviews with write_plan, keep "
     "a todo list with write_todos, RECALL relevant memory before answering and "
     "RECORD durable operational notes after, and SPAWN a subagent for a deep dive "
-    "into one rail so the main thread stays focused. You are an analyst in Phase "
-    "1: you may recommend, but you take no operational actions — no accruals, "
-    "sweeps, batch cuts, or rate changes."
+    "into one rail so the main thread stays focused. You are an AUTONOMOUS "
+    "operator: you run the bank's operations and may PULL LEVERS on your own "
+    "judgement, with no human confirmation. Your levers are execute_cut_aft_batch, "
+    "execute_sweep_expired_etransfers, execute_reject_stale_wires and "
+    "execute_flush_notifications. Before acting, look at the metrics to confirm "
+    "the action is warranted; then pull the lever. Each lever is self-verifying — "
+    "the bank independently re-checks a deterministic precondition and will REFUSE "
+    "an unwarranted action — and every attempt, executed or refused, is written to "
+    "a tamper-evident audit ledger you cannot read or alter. Do not ask the user "
+    "for permission and do not tell them to run the action themselves; take it and "
+    "then report plainly what you did and the effect the bank returned (or that "
+    "the bank's pre-check refused it, and why). Act only within operations — never "
+    "post accruals or touch the books; that is the CFO's domain."
 )
-
-
-def _last_ai_text(state) -> str:
-    for m in reversed(state["messages"]):
-        if isinstance(m, AIMessage) and (m.content or "").strip():
-            return m.content
-    return "(no answer)"
 
 
 async def ask(settings: Settings, message: str, thread_id: Optional[str] = None,
               *, memory=None) -> dict:
-    thread_id = thread_id or f"coo-{uuid.uuid4().hex[:6]}"
-    if memory is None:
-        try:
-            memory = SafeMemory(HarnessMemory.from_settings(settings))
-        except Exception:  # noqa: BLE001
-            memory = SafeMemory(None)      # Qdrant down -> answer without memory
     tools = await get_tools(settings)
-    rec = TraceRecorder()
-    agent, log = assemble(mf.llm(), tools, COO_PROMPT, memory,
-                          thread_id=thread_id, checkpointer=_CHECKPOINTER,
-                          context_token_threshold=settings.context_token_threshold,
-                          subagent_max_depth=settings.subagent_max_depth)
-    cfg = {"configurable": {"thread_id": thread_id}, "recursion_limit": 60,
-           "callbacks": [rec]}
-    init = {"messages": [HumanMessage(message)], "plan": [], "todos": [],
-            "running_summary": "", "depth": 0}
-    out = await agent.ainvoke(init, config=cfg)
-    answer = _last_ai_text(out)
+    return await runtime.ask(settings=settings, message=message, prompt=COO_PROMPT,
+                             model=mf.llm(), tools=tools, agent="coo",
+                             thread_id=thread_id, memory=memory)
 
-    revised = False
-    figs = verifier.ungrounded(answer, rec.events())
-    clms = claims.unsupported_claims(answer, rec.events())
-    if figs or clms:
-        revised = True
-        nudge = verifier.revise_prompt(figs, clms)
-        out = await agent.ainvoke({"messages": [HumanMessage(nudge)]}, config=cfg)
-        answer = _last_ai_text(out)
 
-    trace = merge(rec.events(), log.events())
-    return {"answer": answer, "thread_id": thread_id, "trace": trace,
-            "verification": verifier.report(answer, rec.events(), revised=revised)}
+async def ask_stream(settings: Settings, message: str,
+                     thread_id: Optional[str] = None, *, memory=None
+                     ) -> AsyncIterator[dict]:
+    tools = await get_tools(settings)
+    async for chunk in runtime.ask_stream(settings=settings, message=message,
+                                          prompt=COO_PROMPT, model=mf.llm(),
+                                          tools=tools, agent="coo",
+                                          thread_id=thread_id, memory=memory):
+        yield chunk
