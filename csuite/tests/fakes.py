@@ -47,3 +47,24 @@ def fake_ops_tools() -> list:
         return {"window": window, "by_rail": {"interac": {"total_count": 7}}}
 
     return [float_position, rails]
+
+
+def fake_platform_tools() -> list:
+    @tool
+    def estate_health() -> dict:
+        """Canned estate health."""
+        return {"deployments": [{"name": "coo", "desired": 1, "ready": 1,
+                                 "healthy": True}],
+                "rollup": {"total": 1, "healthy": 1, "degraded": 0}}
+
+    @tool
+    def service_health() -> dict:
+        """Canned service health."""
+        return {"healthy": ["bank-api"], "unhealthy": [], "failing_checks": []}
+
+    @tool
+    def execute_rollout_restart(cluster: str, deployment: str) -> dict:
+        """Canned restart lever."""
+        return {"outcome": "executed", "effect": {"restarted_at": "t"}}
+
+    return [estate_health, service_health, execute_rollout_restart]
