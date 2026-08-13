@@ -44,6 +44,70 @@ def extract_highlights(trace: list[dict]) -> dict:
             "compactions": compactions}
 
 
+import re  # noqa: E402
+
+_LEVER_TOOLS = {"execute_rollback", "execute_rollout_restart"}
+
+
+def beat_outcome(trace: list[dict], outcome_hint: str | None = None) -> dict:
+    """Derive a beat's outcome chip from its trace. Lever tools carry the truth
+    in their output ({"outcome": "executed"|"refused", ...}); read it from the
+    LAST lever call. With no lever, fall back to the beat's declared hint (e.g.
+    a scope 'deferred') or 'read_only'. Pure."""
+    last = None
+    for ev in trace:
+        if ev.get("kind") == "tool" and ev.get("name") in _LEVER_TOOLS:
+            last = ev
+    if last is None:
+        return {"kind": outcome_hint or "read_only", "detail": ""}
+
+    text = last.get("output")
+    text = text if isinstance(text, str) else str(text)
+    kind = "refused" if "refused" in text.lower() else "executed"
+
+    detail = ""
+    m = re.search(r"rolled_back_to['\"]?\s*[:=]\s*['\"]?(\d+)", text)
+    if m:
+        detail = f"rolled back to rev {m.group(1)}"
+    else:
+        m = re.search(r"restarted_at['\"]?\s*[:=]\s*['\"]?([0-9T:\-.\+Z]+)", text)
+        if m:
+            detail = f"restarted at {m.group(1)}"
+        else:
+            m = re.search(r"reason['\"]?\s*[:=]\s*['\"]([^'\"]+)", text)
+            if m:
+                detail = m.group(1)
+    return {"kind": kind, "detail": detail}
+
+
+from datetime import datetime, timezone  # noqa: E402
+
+
+def beat_record(n: int, beat: dict, resp: dict, now: datetime | None = None) -> dict:
+    """Turn one demo beat + its /ask response into a JSON-serialisable record —
+    the unit the presentation console reads (one JSON line per beat). Pure."""
+    trace = resp.get("trace", []) or []
+    h = extract_highlights(trace)
+    ts = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {
+        "beat": n,
+        "title": beat.get("title", ""),
+        "shows": beat.get("shows", ""),
+        "question": beat.get("message", ""),
+        "harness": {
+            "planned": len(h["plan"]),
+            "todos": len(h["todos"]),
+            "subagents": len(h["subagents"]),
+            "tools": list(h["tools"].keys()),
+            "recalls": h["recalls"],
+            "records": h["records"],
+        },
+        "answer": resp.get("answer", ""),
+        "outcome": beat_outcome(trace, beat.get("outcome_hint")),
+        "ts": ts,
+    }
+
+
 # --- run-tree view: normalize a merged trace into renderable steps ----------
 
 _TOOL_META = {
