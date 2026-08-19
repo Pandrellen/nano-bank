@@ -1,6 +1,6 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { PiggyBank, Wallet, AlertCircle, Plus } from "lucide-react";
+import { PiggyBank, Wallet, AlertCircle, Plus, ArrowLeftRight } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
 import { Account } from "@/lib/accounts";
 import BackLink from "@/components/BackLink";
@@ -65,15 +65,26 @@ export default async function AccountsPage() {
                 <GlassCard>
                     <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8 border-b border-white/10 pb-6">
                         <div>
-                            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
                                 <GradientHeading>Cash & Savings</GradientHeading>
-                                <Link
-                                    href="/dashboard/accounts/create"
-                                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-nanobank-blue-sky/30 bg-nanobank-blue-sky/10 text-nanobank-blue-sky hover:bg-nanobank-blue-sky/20 transition-all text-xs font-semibold self-start sm:self-center cursor-pointer"
-                                >
-                                    <Plus className="w-3.5 h-3.5" />
-                                    Open Account
-                                </Link>
+                                <div className="flex items-center gap-2">
+                                    <Link
+                                        href="/dashboard/accounts/create"
+                                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-nanobank-blue-sky/30 bg-nanobank-blue-sky/10 text-nanobank-blue-sky hover:bg-nanobank-blue-sky/20 transition-all text-xs font-semibold self-start sm:self-center cursor-pointer"
+                                    >
+                                        <Plus className="w-3.5 h-3.5" />
+                                        Open Account
+                                    </Link>
+                                    {depositAccounts.length >= 2 && (
+                                        <Link
+                                            href="/dashboard/accounts/transfer"
+                                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-all text-xs font-semibold self-start sm:self-center cursor-pointer"
+                                        >
+                                            <ArrowLeftRight className="w-3.5 h-3.5" />
+                                            Transfer
+                                        </Link>
+                                    )}
+                                </div>
                             </div>
                         </div>
                         <div className="text-right">

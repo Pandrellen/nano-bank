@@ -1,12 +1,13 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { ArrowDownLeft, ArrowUpRight, AlertCircle } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, ArrowLeftRight, AlertCircle } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
 import { Account } from "@/lib/accounts";
 import { TransactionResponse, TransactionHistoryResponse } from "@/lib/transactions";
 import BackLink from "@/components/BackLink";
 import GlassCard from "@/components/GlassCard";
 import GradientHeading from "@/components/GradientHeading";
+import Link from "next/link";
 
 export const metadata: Metadata = {
   title: 'Nano-Bank - Account Details',
@@ -149,6 +150,16 @@ export default async function AccountDetailsPage({ params }: Props) {
                                 <p className="text-2xl font-extrabold text-white mt-0.5">
                                     {formatCurrency(parseFloat(account.balance))}
                                 </p>
+                                {(account.account_type === "chequing" || account.account_type === "savings") &&
+                                    account.status === "active" && (
+                                        <Link
+                                            href={`/dashboard/accounts/transfer?from=${account.account_id}`}
+                                            className="inline-flex items-center gap-1.5 mt-2 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-all text-xs font-semibold cursor-pointer"
+                                        >
+                                            <ArrowLeftRight className="w-3.5 h-3.5" />
+                                            Transfer
+                                        </Link>
+                                    )}
                             </div>
                         </div>
                     )}
