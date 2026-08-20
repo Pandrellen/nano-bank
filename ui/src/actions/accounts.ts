@@ -157,3 +157,66 @@ export async function transferMoneyAction(formData: FormData): Promise<TransferM
 
   return { success: true, message: "Transfer complete." };
 }
+
+export interface DepositMoneyResult {
+  success: boolean;
+  message: string;
+}
+
+export async function depositMoneyAction(formData: FormData): Promise<DepositMoneyResult> {
+  const accountId = formData.get("accountId");
+  const amountRaw = formData.get("amount");
+  const description = formData.get("description");
+
+  if (typeof accountId !== "string" || !accountId) {
+    return { success: false, message: "Please choose an account to deposit into." };
+  }
+
+  const amount = typeof amountRaw === "string" ? Number(amountRaw) : NaN;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return { success: false, message: "Enter an amount greater than $0.00." };
+  }
+
+  const cookieStore = await cookies();
+  const accessToken = cookieStore.get("access_token")?.value;
+  if (!accessToken) {
+    return { success: false, message: "Your session has expired. Please sign in again." };
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/v1/transactions/deposit`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+      },
+      body: JSON.stringify({
+        account_id: accountId,
+        amount,
+        description: typeof description === "string" && description.trim() ? description.trim() : "Deposit",
+      }),
+      cache: "no-store",
+    });
+  } catch (error) {
+    console.error("Deposit request failed:", error);
+    return { success: false, message: "Unable to reach the server. Please try again." };
+  }
+
+  if (!response.ok) {
+    let message = "Unable to complete the deposit.";
+    try {
+      const errorBody: ApiErrorBody = await response.json();
+      message = friendlyErrorMessage(errorBody, message);
+    } catch (error) {
+      console.error("Failed to parse deposit error response:", error);
+    }
+    return { success: false, message };
+  }
+
+  revalidatePath("/dashboard");
+  revalidatePath("/dashboard/accounts");
+  revalidatePath(`/dashboard/accounts/${accountId}`);
+
+  return { success: true, message: "Deposit complete." };
+}

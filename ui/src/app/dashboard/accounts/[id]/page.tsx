@@ -1,6 +1,6 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { ArrowDownLeft, ArrowUpRight, ArrowLeftRight, AlertCircle } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, ArrowLeftRight, ArrowDownToLine, AlertCircle } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
 import { Account } from "@/lib/accounts";
 import { TransactionResponse, TransactionHistoryResponse } from "@/lib/transactions";
@@ -152,13 +152,22 @@ export default async function AccountDetailsPage({ params }: Props) {
                                 </p>
                                 {(account.account_type === "chequing" || account.account_type === "savings") &&
                                     account.status === "active" && (
-                                        <Link
-                                            href={`/dashboard/accounts/transfer?from=${account.account_id}`}
-                                            className="inline-flex items-center gap-1.5 mt-2 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-all text-xs font-semibold cursor-pointer"
-                                        >
-                                            <ArrowLeftRight className="w-3.5 h-3.5" />
-                                            Transfer
-                                        </Link>
+                                        <div className="flex items-center gap-2 mt-2 justify-end">
+                                            <Link
+                                                href={`/dashboard/accounts/deposit?account=${account.account_id}`}
+                                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-all text-xs font-semibold cursor-pointer"
+                                            >
+                                                <ArrowDownToLine className="w-3.5 h-3.5" />
+                                                Deposit
+                                            </Link>
+                                            <Link
+                                                href={`/dashboard/accounts/transfer?from=${account.account_id}`}
+                                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10 transition-all text-xs font-semibold cursor-pointer"
+                                            >
+                                                <ArrowLeftRight className="w-3.5 h-3.5" />
+                                                Transfer
+                                            </Link>
+                                        </div>
                                     )}
                             </div>
                         </div>

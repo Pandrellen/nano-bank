@@ -75,7 +75,7 @@ export default async function Page() {
                 </div>
 
                 <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/30 p-8 text-center text-sm text-slate-400">
-                    Your accounts, cards, and transactions will show up here.
+                    Your account summaries will show below.
                 </div>
             </GlassCard>
 
