@@ -1153,6 +1153,10 @@ fn push_filters(
         qb.push(" AND t.status = ");
         qb.push_bind(status.clone());
     }
+    if let Some(ref description) = q.description {
+        qb.push(" AND t.description ILIKE ");
+        qb.push_bind(format!("%{description}%"));
+    }
     if let Some(start_date) = q.start_date {
         qb.push(" AND t.created_at >= ");
         qb.push_bind(start_date);
