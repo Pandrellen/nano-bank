@@ -199,9 +199,10 @@ export default async function AccountDetailsPage({ params }: Props) {
                                 const signedAmount = (isCredit ? 1 : -1) * parseFloat(txn.amount);
 
                                 return (
-                                    <div
+                                    <Link
                                         key={txn.transaction_id}
-                                        className="flex items-center justify-between gap-4 p-4 rounded-xl border border-white/5 bg-slate-900/40"
+                                        href={`/dashboard/transactions/${txn.transaction_id}?account=${id}`}
+                                        className="flex items-center justify-between gap-4 p-4 rounded-xl border border-white/5 bg-slate-900/40 hover:border-white/15 hover:bg-slate-900/60 transition-all cursor-pointer block group"
                                     >
                                         <div className="flex items-center gap-3 min-w-0">
                                             <div className={`p-2.5 rounded-lg flex-shrink-0 ${
@@ -234,7 +235,7 @@ export default async function AccountDetailsPage({ params }: Props) {
                                         <p className={`text-sm font-bold flex-shrink-0 ${isCredit ? "text-emerald-400" : "text-white"}`}>
                                             {isCredit ? "+" : "-"}{formatCurrency(Math.abs(signedAmount))}
                                         </p>
-                                    </div>
+                                    </Link>
                                 );
                             })}
                         </div>
