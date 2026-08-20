@@ -98,12 +98,16 @@ export default async function TransactionDetailsPage({ params, searchParams }: P
         }
     }
 
-    const backHref = backAccountId ? `/dashboard/accounts/${backAccountId}` : "/dashboard/accounts";
+    const backHref = backAccountId
+        ? `/dashboard/accounts/${backAccountId}/transactions`
+        : "/dashboard/accounts";
 
     return (
         <main className="relative z-10 flex-1 flex flex-col items-center justify-center px-6 py-12">
             <div className="w-full max-w-3xl">
-                <BackLink href={backHref}>Back</BackLink>
+                <BackLink href={backHref}>
+                    {backAccountId ? "Back to Transactions" : "Back"}
+                </BackLink>
 
                 <GlassCard>
                     <div className="mb-8 border-b border-white/10 pb-6">

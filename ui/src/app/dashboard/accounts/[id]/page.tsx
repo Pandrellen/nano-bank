@@ -1,6 +1,6 @@
 import { requireSession } from "@/lib/session";
 import { Metadata } from 'next';
-import { ArrowDownLeft, ArrowUpRight, ArrowLeftRight, ArrowDownToLine, AlertCircle } from "lucide-react";
+import { ArrowLeftRight, ArrowDownToLine, AlertCircle } from "lucide-react";
 import { API_BASE_URL } from "@/lib/config";
 import { Account } from "@/lib/accounts";
 import { TransactionResponse, TransactionHistoryResponse } from "@/lib/transactions";
@@ -198,52 +198,60 @@ export default async function AccountDetailsPage({ params }: Props) {
                             No transactions on this account yet.
                         </div>
                     ) : (
-                        <div className="space-y-3">
-                            {transactions.map((txn) => {
-                                const myEntry = txn.entries.find((e) => e.account_id === id);
-                                const isCredit = myEntry?.entry_type === "Credit";
-                                const signedAmount = (isCredit ? 1 : -1) * parseFloat(txn.amount);
+                        <div className="overflow-x-auto -mx-2">
+                            <table className="w-full text-sm border-collapse">
+                                <thead>
+                                    <tr className="text-left text-[10px] uppercase tracking-wider text-slate-500 border-b border-white/10">
+                                        <th className="px-2 py-3 font-semibold whitespace-nowrap">Date</th>
+                                        <th className="px-2 py-3 font-semibold">Description</th>
+                                        <th className="px-2 py-3 font-semibold whitespace-nowrap">Type</th>
+                                        <th className="px-2 py-3 font-semibold whitespace-nowrap">Status</th>
+                                        <th className="px-2 py-3 font-semibold text-right whitespace-nowrap">Amount</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {transactions.map((txn) => {
+                                        const myEntry = txn.entries.find((e) => e.account_id === id);
+                                        const isCredit = myEntry?.entry_type === "Credit";
+                                        const signedAmount = (isCredit ? 1 : -1) * parseFloat(txn.amount);
 
-                                return (
-                                    <Link
-                                        key={txn.transaction_id}
-                                        href={`/dashboard/transactions/${txn.transaction_id}?account=${id}`}
-                                        className="flex items-center justify-between gap-4 p-4 rounded-xl border border-white/5 bg-slate-900/40 hover:border-white/15 hover:bg-slate-900/60 transition-all cursor-pointer block group"
-                                    >
-                                        <div className="flex items-center gap-3 min-w-0">
-                                            <div className={`p-2.5 rounded-lg flex-shrink-0 ${
-                                                isCredit
-                                                    ? "bg-emerald-500/10 text-emerald-400"
-                                                    : "bg-slate-500/10 text-slate-300"
-                                            }`}>
-                                                {isCredit ? (
-                                                    <ArrowDownLeft className="w-4 h-4" />
-                                                ) : (
-                                                    <ArrowUpRight className="w-4 h-4" />
-                                                )}
-                                            </div>
-                                            <div className="min-w-0">
-                                                <div className="flex items-center gap-2">
-                                                    <p className="text-sm font-semibold text-white truncate">
+                                        return (
+                                            <tr
+                                                key={txn.transaction_id}
+                                                className="border-b border-white/5 hover:bg-white/5 transition-colors"
+                                            >
+                                                <td className="px-2 py-3 text-slate-400 whitespace-nowrap align-top">
+                                                    {formatDate(txn.created_at)}
+                                                </td>
+                                                <td className="px-2 py-3 align-top">
+                                                    <Link
+                                                        href={`/dashboard/transactions/${txn.transaction_id}?account=${id}`}
+                                                        className="text-white font-medium hover:underline hover:text-nanobank-blue-sky transition-colors"
+                                                    >
                                                         {txn.description || transactionTypeLabel(txn.transaction_type)}
-                                                    </p>
-                                                    {txn.status !== "Completed" && (
-                                                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full flex-shrink-0 ${statusBadgeClasses(txn.status)}`}>
-                                                            {txn.status}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                <p className="text-xs text-slate-400 mt-0.5">
-                                                    {transactionTypeLabel(txn.transaction_type)} &middot; {formatDate(txn.created_at)}
-                                                </p>
-                                            </div>
-                                        </div>
-                                        <p className={`text-sm font-bold flex-shrink-0 ${isCredit ? "text-emerald-400" : "text-white"}`}>
-                                            {isCredit ? "+" : "-"}{formatCurrency(Math.abs(signedAmount))}
-                                        </p>
-                                    </Link>
-                                );
-                            })}
+                                                    </Link>
+                                                </td>
+                                                <td className="px-2 py-3 text-slate-400 whitespace-nowrap align-top">
+                                                    {transactionTypeLabel(txn.transaction_type)}
+                                                </td>
+                                                <td className="px-2 py-3 align-top">
+                                                    <span
+                                                        className={`text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${statusBadgeClasses(txn.status)}`}
+                                                    >
+                                                        {txn.status}
+                                                    </span>
+                                                </td>
+                                                <td
+                                                    className={`px-2 py-3 text-right font-bold whitespace-nowrap align-top ${isCredit ? "text-emerald-400" : "text-white"}`}
+                                                >
+                                                    {isCredit ? "+" : "-"}
+                                                    {formatCurrency(Math.abs(signedAmount))}
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
                         </div>
                     )}
                 </GlassCard>
