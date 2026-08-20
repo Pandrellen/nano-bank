@@ -17,7 +17,7 @@ type Props = {
   params: Promise<{ id: string }>;
 };
 
-const TRANSACTIONS_LIMIT = 25;
+const TRANSACTIONS_LIMIT = 10;
 
 const formatCurrency = (val: number) => {
   return new Intl.NumberFormat("en-CA", {
@@ -176,8 +176,14 @@ export default async function AccountDetailsPage({ params }: Props) {
 
                 {/* Transactions Card */}
                 <GlassCard>
-                    <div className="mb-6 border-b border-white/10 pb-4">
+                    <div className="mb-6 border-b border-white/10 pb-4 flex items-center justify-between">
                         <h2 className="text-lg font-bold text-white">Recent Transactions</h2>
+                        <Link
+                            href={`/dashboard/accounts/${id}/transactions`}
+                            className="text-xs font-semibold text-nanobank-blue-sky hover:underline"
+                        >
+                            View All
+                        </Link>
                     </div>
 
                     {transactionsError ? (
